@@ -10,7 +10,7 @@ N_BITS          = 10             # small window
 N               = 2**N_BITS
 DIFFICULTY_BITS = 6              # easy PoW
 DATA            = b"BLOCK_HEADER_001"
-TARGET_RANDOM   = 300
+TARGET_RANDOM   = 3000
 
 p         = 2**(-DIFFICULTY_BITS)
 M_est     = N * p
@@ -109,11 +109,6 @@ def get_prob(nonce):
 valid_prob  = sum(get_prob(v) for v in random_nonces) * 100
 random_prob = sum(get_prob(r) for r in random_nonces) * 100
 marked_prob = valid_prob + random_prob
-
-print(f"\n── Probability mass ─────────────────────────────")
-print(f"  All marked states:        {marked_prob:6.2f}%")
-print(f"    True valid:             {valid_prob:6.2f}%")
-print(f"    Random incorrect:       {random_prob:6.2f}%")
 
 found = int(max(counts, key=counts.get), 2)
 print(f"\n── Peak measurement ───────────────────────────────")
