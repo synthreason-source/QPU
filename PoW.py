@@ -10,7 +10,7 @@ N_BITS          = 10             # small window
 N               = 2**N_BITS
 DIFFICULTY_BITS = 6               # easy PoW
 DATA            = b"BLOCK_HEADER_001"
-TARGET_RANDOM = 60
+TARGET_RANDOM = 300
 p         = 2**(-DIFFICULTY_BITS)
 M_est     = N * p
 n_opt_est = math.pi / 4 * math.sqrt(N / M_est)
@@ -44,7 +44,7 @@ print(f"True valid nonces (M={len(valid_nonces)})")
 # phase flips and Grover amplification.
 print(f"\nSampling {TARGET_RANDOM} random incorrect nonces...")
 valid_set     = set(valid_nonces)
-rng           = random.Random(42)
+rng           = random.Random()
 random_nonces = []
 
 while len(random_nonces) < TARGET_RANDOM:
