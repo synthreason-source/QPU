@@ -10,7 +10,7 @@ N_BITS          = 17
 DATA            = b"BLOCK_HEADER_001"
 DIFFICULTY_BITS = 11
 N               = 2**N_BITS
-TARGET_RANDOM   = 6000          # Random incorrect nonces to add to marked set
+TARGET_RANDOM   = 370          # Random incorrect nonces to add to marked set # check out the ratios of true/random the grover algorithm succeeds
 
 p         = 2**(-DIFFICULTY_BITS)
 M_est     = N * p
