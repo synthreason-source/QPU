@@ -6,11 +6,11 @@ from qiskit import QuantumCircuit, transpile
 from qiskit_aer import AerSimulator
 
 # ── CONFIG ─────────────────────────────────────────────────────────────
-N_BITS          = 12              # small window
+N_BITS          = 17             # small window
 N               = 2**N_BITS
 DIFFICULTY_BITS = 6               # easy PoW
 DATA            = b"BLOCK_HEADER_001"
-TARGET_RANDOM = 60
+TARGET_RANDOM = 11600
 p         = 2**(-DIFFICULTY_BITS)
 M_est     = N * p
 n_opt_est = math.pi / 4 * math.sqrt(N / M_est)
