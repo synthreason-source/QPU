@@ -115,7 +115,7 @@ def classify(nonce: int) -> str:
 
 print("\n── Top 10 measured states ───────────────────────────────────────────")
 top10 = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:10]
-for state_str, cnt in top10[:10]:
+for state_str, cnt in top10:
     state_int = int(state_str, 2)
     print(f"  {state_int:>12,}  {cnt:>6,} shots  {cnt/shots*100:>5.2f}%  {classify(state_int)}")
 
@@ -130,7 +130,7 @@ print(f"    Random incorrect:     {random_prob:6.2f}%  ({len(random_nonces)} sta
 print(f"  Per-state avg (marked): {marked_prob / M:6.3f}%")
 
 print(f"\n── Per-state probabilities ──────────────────────────────────────────")
-for v in valid_nonces:
+for v in valid_nonces[:10]:
     print(f"  {v:>12,}  {get_prob(v)*100:>6.3f}%  VALID")
 for r in random_nonces[:10]:
     print(f"  {r:>12,}  {get_prob(r)*100:>6.3f}%  RANDOM")
