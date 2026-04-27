@@ -6,11 +6,11 @@ from qiskit import QuantumCircuit, transpile
 from qiskit_aer import AerSimulator
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-N_BITS          = 17
+N_BITS          = 19
 DATA            = b"BLOCK_HEADER_001"
 DIFFICULTY_BITS = 11
 N               = 2**N_BITS
-TARGET_RANDOM   = 370          # Random incorrect nonces to add to marked set # check out the ratios of true/random the grover algorithm succeeds
+TARGET_RANDOM   = 37000          # Random incorrect nonces to add to marked set # check out the ratios of true/random the grover algorithm succeeds
 
 p         = 2**(-DIFFICULTY_BITS)
 M_est     = N * p
@@ -115,7 +115,7 @@ def classify(nonce: int) -> str:
 
 print("\n── Top 10 measured states ───────────────────────────────────────────")
 top10 = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:10]
-for state_str, cnt in top10:
+for state_str, cnt in top10[:10]:
     state_int = int(state_str, 2)
     print(f"  {state_int:>12,}  {cnt:>6,} shots  {cnt/shots*100:>5.2f}%  {classify(state_int)}")
 
