@@ -6,11 +6,11 @@ from qiskit import QuantumCircuit, transpile
 from qiskit_aer import AerSimulator
 
 # ── CONFIG ─────────────────────────────────────────────────────────────
-N_BITS          = 17             # small window
+N_BITS          = 10             # small window
 N               = 2**N_BITS
 DIFFICULTY_BITS = 6               # easy PoW
 DATA            = b"BLOCK_HEADER_001"
-TARGET_RANDOM = 11600
+TARGET_RANDOM = 60
 p         = 2**(-DIFFICULTY_BITS)
 M_est     = N * p
 n_opt_est = math.pi / 4 * math.sqrt(N / M_est)
@@ -36,7 +36,7 @@ def check_pow_bits(nonce: int) -> bool:
 print("\nUsing known valid nonce...")
 valid_nonces = [n for n in range(N) if check_pow_bits(n)]
 
-print(f"True valid nonces (M={len(valid_nonces)}): {valid_nonces}")
+print(f"True valid nonces (M={len(valid_nonces)})")
 
 # ── RANDOM INCORRECT NONCES ───────────────────────────────────────────────────
 # Plain random nonces that fail the PoW check — no hash structure requirement.
@@ -58,7 +58,7 @@ print(f"Sampled {len(random_nonces)} random incorrect nonces")
 # ── COMBINED MARKED SET ───────────────────────────────────────────────────────
 valid_nonces = list(set(valid_nonces + random_nonces))
 
-print(f"Valid nonces (M={len(valid_nonces)}): {valid_nonces}")
+print(f"Valid nonces (M={len(valid_nonces)})")
 
 # ── GROVER CIRCUIT (only valid_nonces marked) ─────────────────────────
 def phase_oracle(marked, n):
