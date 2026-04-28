@@ -88,10 +88,6 @@ sim = AerSimulator(method="statevector")
 alive = list(range(N))
 random.shuffle(alive)
 
-# Ensure planted nonce is in the pool
-if planted_nonce not in alive:
-    alive[0] = planted_nonce
-
 print("── Quantum stacked halving — PoW nonce search ───")
 print(f"  {'Round':>6}  {'Alive nonces':>13}  {'P(hit)':>14}  {'Sampled':>12}  {'Hash prefix (hex)':>20}  Result")
 print(f"  {'─'*6}  {'─'*13}  {'─'*14}  {'─'*12}  {'─'*20}  {'─'*22}")
