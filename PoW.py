@@ -91,8 +91,8 @@ while len(alive) > 0:
 
     # Oracle checks the DROP half — if valid nonce is there, swap
     # This is the key: we verify AFTER the cut, not before
-    if drop_half and !half_contains_valid(drop_half):
-        alive = keep_half   # valid nonce is in the half we were about to discard
+    if drop_half and not half_contains_valid(drop_half):
+        alive = drop_half   # valid nonce is in the half we were about to discard
     else:
         alive = drop_half   # valid nonce is in the keep half (or doesn't exist)
 
