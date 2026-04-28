@@ -1,10 +1,10 @@
 import hashlib
 import struct
 import math
-import os
 import numpy as np
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister, transpile
 from qiskit.circuit.library import DiagonalGate
+
 from qiskit_aer import AerSimulator
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -28,8 +28,8 @@ from qiskit_aer import AerSimulator
 # ═══════════════════════════════════════════════════════════════════════════════
 
 BLOCK_HEADER = "First quantum sha256 by George W 28-4-2026"
-N_BITS       = 8        # nonce qubits → search space [0, 2^N_BITS)
-DIFF_BITS    = 8        # leading zero bits required
+N_BITS       = 18        # nonce qubits → search space [0, 2^N_BITS)
+DIFF_BITS    = 12        # leading zero bits required
 N            = 2 ** N_BITS
 MASK32       = 0xFFFFFFFF
 
@@ -99,46 +99,24 @@ def oracle_function(nonce: int) -> bool:
     return leading_zeros(pow_hash_hex(nonce)) >= DIFF_BITS
 
 # ── QUANTUM CIRCUITS ──────────────────────────────────────────────────────────
-# ── ORACLE CACHE ──────────────────────────────────────────────────────────────
-# Cache key includes header + N_BITS + DIFF_BITS so any config change
-# automatically invalidates and rebuilds the oracle from scratch.
-_cache_key  = hashlib.sha256(f"{BLOCK_HEADER}|{N_BITS}|{DIFF_BITS}".encode()).hexdigest()[:16]
-ORACLE_DIAG = f"oracle_diag_{_cache_key}_n{N_BITS}_d{DIFF_BITS}.npy"
-ORACLE_MARK = f"oracle_mark_{_cache_key}_n{N_BITS}_d{DIFF_BITS}.npy"
-
 def build_oracle(n_bits: int) -> tuple:
     """
     Diagonal unitary U: U[x,x] = -1 if oracle_function(x) else +1.
-    Saves the phase vector and marked list to disk on first run.
-    Subsequent runs load instantly — skips the O(2^n) SHA-256 scan entirely.
-
-    Cache files: oracle_diag_<key>.npy  +  oracle_mark_<key>.npy
-    Delete them to force a rebuild (e.g. after changing BLOCK_HEADER or DIFF_BITS).
+    All marked nonces encoded in one matrix — O(1) gate regardless of M.
+    No external nonce list — oracle_function() defines the phase flip entirely.
     """
-    if os.path.exists(ORACLE_DIAG) and os.path.exists(ORACLE_MARK):
-        print(f"  Loading oracle from cache: {ORACLE_DIAG}")
-        diag   = np.load(ORACLE_DIAG)
-        marked = np.load(ORACLE_MARK).tolist()
-        print(f"  Cache hit — skipped {2**n_bits:,} SHA-256 evaluations")
-    else:
-        print(f"  Cache miss — scanning {2**n_bits:,} nonces (this runs once then saves)...")
-        dim    = 2 ** n_bits
-        diag   = np.ones(dim, dtype=complex)
-        marked = []
-        for x in range(dim):
-            if oracle_function(x):
-                diag[x] = -1.0 + 0j
-                marked.append(x)
-            if x % max(1, dim // 20) == 0:
-                pct = x / dim * 100
-                print(f"    {pct:5.1f}%  ({x:,} / {dim:,})  found {len(marked)} so far", end='\r')
-        print()
-        np.save(ORACLE_DIAG, diag)
-        np.save(ORACLE_MARK, np.array(marked, dtype=np.int64))
-        print(f"  Saved oracle to {ORACLE_DIAG}  ({os.path.getsize(ORACLE_DIAG)/1e6:.1f} MB)")
-
+    dim    = 2 ** n_bits
+    diag   = np.ones(dim, dtype=complex)
+    marked = []
+    for x in range(dim):
+        if oracle_function(x):
+            diag[x] = -1.0 + 0j
+            marked.append(x)
     qr = QuantumRegister(n_bits, 'q')
     qc = QuantumCircuit(qr)
+    # diagonal() stores only the N-length phase vector — no N×N matrix ever built
+    # Memory: O(2^n) complex128  vs  O(4^n) for UnitaryGate
+    # At N_BITS=20: 16 MB here vs 8 TB with UnitaryGate
     qc.append(DiagonalGate(diag.tolist()), list(range(n_bits)))
     return qc, marked
 
