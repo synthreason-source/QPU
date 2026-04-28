@@ -27,8 +27,8 @@ from qiskit_aer import AerSimulator
 # ═══════════════════════════════════════════════════════════════════════════════
 
 BLOCK_HEADER = "First quantum sha256 by George W 28-4-2026"
-N_BITS       = 7        # nonce qubits → search space [0, 2^N_BITS)
-DIFF_BITS    = 7        # leading zero bits required
+N_BITS       = 8        # nonce qubits → search space [0, 2^N_BITS)
+DIFF_BITS    = 8        # leading zero bits required
 N            = 2 ** N_BITS
 MASK32       = 0xFFFFFFFF
 
