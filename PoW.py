@@ -3,7 +3,8 @@ import struct
 import math
 import numpy as np
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister, transpile
-from qiskit.circuit.library import UnitaryGate
+from qiskit.circuit.library import DiagonalGate
+
 from qiskit_aer import AerSimulator
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -27,8 +28,8 @@ from qiskit_aer import AerSimulator
 # ═══════════════════════════════════════════════════════════════════════════════
 
 BLOCK_HEADER = "First quantum sha256 by George W 28-4-2026"
-N_BITS       = 8        # nonce qubits → search space [0, 2^N_BITS)
-DIFF_BITS    = 8        # leading zero bits required
+N_BITS       = 18        # nonce qubits → search space [0, 2^N_BITS)
+DIFF_BITS    = 12        # leading zero bits required
 N            = 2 ** N_BITS
 MASK32       = 0xFFFFFFFF
 
@@ -113,7 +114,10 @@ def build_oracle(n_bits: int) -> tuple:
             marked.append(x)
     qr = QuantumRegister(n_bits, 'q')
     qc = QuantumCircuit(qr)
-    qc.append(UnitaryGate(np.diag(diag), label='SHA256⊗Oracle'), qr)
+    # diagonal() stores only the N-length phase vector — no N×N matrix ever built
+    # Memory: O(2^n) complex128  vs  O(4^n) for UnitaryGate
+    # At N_BITS=20: 16 MB here vs 8 TB with UnitaryGate
+    qc.append(DiagonalGate(diag.tolist()), list(range(n_bits)))
     return qc, marked
 
 def build_diffusion(n_bits: int) -> QuantumCircuit:
@@ -123,7 +127,7 @@ def build_diffusion(n_bits: int) -> QuantumCircuit:
     qr = QuantumRegister(n_bits, 'q')
     qc = QuantumCircuit(qr)
     qc.h(qr)
-    qc.append(UnitaryGate(np.diag(diag), label='Diffuse'), qr)
+    qc.append(DiagonalGate(diag.tolist()), list(range(n_bits)))
     qc.h(qr)
     return qc
 
