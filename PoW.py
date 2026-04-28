@@ -94,7 +94,7 @@ while len(alive) > 0:
     if drop_half and not half_contains_valid(drop_half):
         alive = drop_half   # valid nonce is in the half we were about to discard
     else:
-        alive = drop_half   # valid nonce is in the keep half (or doesn't exist)
+        alive = keep_half   # valid nonce is in the keep half (or doesn't exist)
 
 # ── FULL BLOCK VERIFICATION ───────────────────────
 print()
