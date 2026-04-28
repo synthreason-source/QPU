@@ -6,9 +6,9 @@ from qiskit import QuantumCircuit, transpile
 from qiskit_aer import AerSimulator
 
 # ── CONFIG ───────────────────────────────────────
-N_BITS    = 21
+N_BITS    = 24
 N         = 2**N_BITS
-DIFF_BITS = 19
+DIFF_BITS = 22
 
 BLOCK_HEADER = "First quantum sha256 by George W 28-4-2026"
 
@@ -91,10 +91,10 @@ while len(alive) > 0:
 
     # Oracle checks the DROP half — if valid nonce is there, swap
     # This is the key: we verify AFTER the cut, not before
-    if drop_half and half_contains_valid(drop_half):
-        alive = drop_half   # valid nonce is in the half we were about to discard
+    if drop_half and !half_contains_valid(drop_half):
+        alive = keep_half   # valid nonce is in the half we were about to discard
     else:
-        alive = keep_half   # valid nonce is in the keep half (or doesn't exist)
+        alive = drop_half   # valid nonce is in the keep half (or doesn't exist)
 
 # ── FULL BLOCK VERIFICATION ───────────────────────
 print()
