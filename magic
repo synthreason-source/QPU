@@ -1,0 +1,43 @@
+import math
+from sympy import divisors
+
+class GeometryShifter:
+    def __init__(self, N):
+        self.N = N
+        self.center = math.isqrt(N)
+
+    def get_shifted_pairs(self):
+        """
+        Auto-generates symmetric pairs and shifts them to the geometric origin.
+        """
+        # Fetch divisors using optimized sympy method
+        divs = sorted(divisors(self.N))
+        
+        # Auto-generate symmetric pairs
+        pairs = [(d, self.N // d) for d in divs]
+        
+        shifted_data = []
+        for p, q in pairs:
+            # Shift transformation: (x - sqrt(N), y - sqrt(N))
+            sp, sq = p - self.center, q - self.center
+            # Distance from origin (geometric rank weight)
+            dist = math.sqrt(sp**2 + sq**2)
+            shifted_data.append({
+                "original": (p, q),
+                "shifted": (sp, sq),
+                "distance": dist
+            })
+            
+        return shifted_data
+
+# --- Execution ---
+N = 200000000000000000000000000000000001
+shifter = GeometryShifter(N)
+results = shifter.get_shifted_pairs()
+
+# Display the top 5 'closest' pairs (lowest geometric rank)
+sorted_results = sorted(results, key=lambda x: x['distance'])
+
+print(f"Top 5 symmetric pairs shifted to geometric origin:")
+for item in sorted_results[:5]:
+    print(f"Pair: {item['original']} | Shifted: {item['shifted']} | Distance: {item['distance']:.2f}")
