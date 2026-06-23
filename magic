@@ -1,43 +1,60 @@
 import math
+import concurrent.futures
 from sympy import divisors
 
+# --- TOP-LEVEL HELPER FUNCTIONS ---
+# These are easily picklable because they are at the module level.
+
+def compute_distance_task(args):
+    """
+    Unpacks arguments and computes distance.
+    This replaces the need for lambdas or partials.
+    """
+    p, q, center = args
+    sp, sq = p - center, q - center
+    dist = math.sqrt(sp**2 + sq**2)
+    return {
+        "original": (p, q),
+        "shifted": (sp, sq),
+        "distance": dist
+    }
+
+def get_distance(item):
+    """Named helper for sorting."""
+    return item['distance']
+
+# --- GEOMETRY SHIFTER ---
 class GeometryShifter:
     def __init__(self, N):
         self.N = N
         self.center = math.isqrt(N)
 
-    def get_shifted_pairs(self):
-        """
-        Auto-generates symmetric pairs and shifts them to the geometric origin.
-        """
-        # Fetch divisors using optimized sympy method
+    def get_shifted_pairs_parallel(self):
         divs = sorted(divisors(self.N))
-        
-        # Auto-generate symmetric pairs
         pairs = [(d, self.N // d) for d in divs]
         
-        shifted_data = []
-        for p, q in pairs:
-            # Shift transformation: (x - sqrt(N), y - sqrt(N))
-            sp, sq = p - self.center, q - self.center
-            # Distance from origin (geometric rank weight)
-            dist = math.sqrt(sp**2 + sq**2)
-            shifted_data.append({
-                "original": (p, q),
-                "shifted": (sp, sq),
-                "distance": dist
-            })
+        # Prepare list of arguments as simple tuples
+        tasks = [(p, q, self.center) for p, q in pairs]
+        
+        results = []
+        # Using a context manager for the executor
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            # Map the named top-level function
+            results = list(executor.map(compute_distance_task, tasks))
             
-        return shifted_data
+        return results
 
-# --- Execution ---
-N = 200000000000000000000000000000000001
-shifter = GeometryShifter(N)
-results = shifter.get_shifted_pairs()
+if __name__ == "__main__":
+    # N is extremely large, sympy will handle it efficiently
+    N = 20000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000026
+    shifter = GeometryShifter(N)
+    
+    print(f"Starting parallel geometric shift...")
+    results = shifter.get_shifted_pairs_parallel()
 
-# Display the top 5 'closest' pairs (lowest geometric rank)
-sorted_results = sorted(results, key=lambda x: x['distance'])
+    # Use the named helper function for sorting instead of a lambda
+    sorted_results = sorted(results, key=get_distance)
 
-print(f"Top 5 symmetric pairs shifted to geometric origin:")
-for item in sorted_results[:5]:
-    print(f"Pair: {item['original']} | Shifted: {item['shifted']} | Distance: {item['distance']:.2f}")
+    print(f"\nTop 5 symmetric pairs:")
+    for item in sorted_results[:5]:
+        print(f"Pair: {item['original']} | Distance: {item['distance']:.2f}")
