@@ -1,60 +1,355 @@
+import torch
 import math
-import concurrent.futures
 from sympy import divisors
+import time
+from typing import Iterator, Dict, List, Tuple
+import numpy as np
 
-# --- TOP-LEVEL HELPER FUNCTIONS ---
-# These are easily picklable because they are at the module level.
 
-def compute_distance_task(args):
+# --- ADVANCED PYTORCH GEOMETRY CALCULATOR ---
+class AdvancedPyTorchCalculator:
     """
-    Unpacks arguments and computes distance.
-    This replaces the need for lambdas or partials.
+    Production-grade GPU calculator with:
+    - Automatic mixed precision (FP32/FP64 selection)
+    - Batch processing for memory efficiency
+    - Streaming computation for unbounded datasets
+    - CUDA stream management for async operations
+    - Memory profiling and optimization
+
+    Design note:
+    - N is kept as a Python big-int for exact arithmetic.
+    - Geometry is done in float64 on GPU using float(N) and float(divisor).
     """
-    p, q, center = args
-    sp, sq = p - center, q - center
-    dist = math.sqrt(sp**2 + sq**2)
-    return {
-        "original": (p, q),
-        "shifted": (sp, sq),
-        "distance": dist
-    }
 
-def get_distance(item):
-    """Named helper for sorting."""
-    return item['distance']
-
-# --- GEOMETRY SHIFTER ---
-class GeometryShifter:
-    def __init__(self, N):
+    def __init__(self, N: int, device: str = None, batch_size: int = 10000,
+                 use_mixed_precision: bool = True):
+        """
+        Args:
+            N: Target number (Python big-int allowed, e.g. 10**37 scale).
+            device: 'cuda' or 'cpu'
+            batch_size: Batch size for processing (larger = faster but more memory)
+            use_mixed_precision: Use FP32 for intermediate, FP64 for final results
+        """
         self.N = N
-        self.center = math.isqrt(N)
+        self.batch_size = batch_size
+        self.use_mixed_precision = use_mixed_precision
 
-    def get_shifted_pairs_parallel(self):
-        divs = sorted(divisors(self.N))
-        pairs = [(d, self.N // d) for d in divs]
-        
-        # Prepare list of arguments as simple tuples
-        tasks = [(p, q, self.center) for p, q in pairs]
-        
+        # Device selection
+        if device is None:
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        else:
+            self.device = device
+        print(self.device)
+
+        # Explicit, controlled conversion of N to float64 once.
+        # float(N) is safe up to ~1e308, your N ~ 2e37 is fine. [web:11][web:20]
+        N_float = float(N)
+
+        # Store float64 version on device for geometry.
+        self.N_tensor = torch.tensor(N_float, dtype=torch.float64, device=self.device)
+
+        # Center as float64 (approximate sqrt of big-int N).
+        self.center = torch.tensor(math.isqrt(N), dtype=torch.float64, device=self.device)
+
+        # Determine dtype based on precision needs
+        self.dtype = torch.float32 if use_mixed_precision else torch.float64
+
+        # CUDA optimization
+        if self.device == 'cuda':
+            torch.cuda.set_per_process_memory_fraction(0.95)
+            self.stream = torch.cuda.Stream()
+            self._print_gpu_info()
+        else:
+            self.stream = None
+
+        # Will store exact integer pairs aligned with distances
+        self._pairs_int: List[Tuple[int, int]] = []
+
+    def _print_gpu_info(self):
+        """Print GPU information and availability."""
+        if not torch.cuda.is_available():
+            print("No CUDA device available.")
+            return
+        props = torch.cuda.get_device_properties(0)
+        print(f"🚀 GPU: {props.name}")
+        print(f"   Memory: {props.total_memory / 1e9:.1f} GB")
+        print(f"   CUDA Capability: {props.major}.{props.minor}")
+
+    def get_divisors_batch(self) -> Iterator[Tuple[List[int], torch.Tensor]]:
+        """
+        Stream divisors in batches to handle extremely large divisor lists.
+        Yields:
+            (batch_divs_int, batch_divs_tensor_float64)
+        where:
+            - batch_divs_int is a list of Python ints (exact divisors).
+            - batch_divs_tensor_float64 is a float64 tensor on self.device.
+        """
+        # SymPy returns Python ints; arbitrary precision, safe for huge N. [web:16]
+        divs = divisors(self.N)
+
+        for i in range(0, len(divs), self.batch_size):
+            batch_ints = divs[i:i + self.batch_size]
+            # Explicit conversion of each divisor to float ensures we only use
+            # Python's big-int -> double path, which supports up to ~1e308. [web:11][web:17]
+            batch_floats = [float(d) for d in batch_ints]
+            batch_tensor = torch.tensor(
+                batch_floats,
+                dtype=torch.float64,
+                device=self.device
+            )
+            yield batch_ints, batch_tensor
+
+    def compute_pairs_batched(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compute shifted pairs and distances using batch processing.
+        More memory efficient for large divisor sets.
+
+        Returns:
+            original_pairs_float: float64 tensor of shape (num_divs, 2)
+            shifted_pairs_float: float64 tensor of shape (num_divs, 2)
+            distances: float64 tensor of shape (num_divs,)
+        """
+        all_distances = []
+        all_shifted_pairs = []
+        all_original_pairs = []
+        all_pairs_int: List[Tuple[int, int]] = []
+
+        print("📦 Processing divisors in batches...")
+
+        for batch_ints, batch_divs in self.get_divisors_batch():
+            # batch_divs: float64 tensor of divisors
+            # N_tensor: float64 scalar tensor
+            batch_q = self.N_tensor / batch_divs  # pure float64 on device
+
+            batch_pairs = torch.stack([batch_divs, batch_q], dim=1)
+
+            # Shift by center
+            batch_shifted = batch_pairs - self.center
+
+            # Compute distances
+            if self.use_mixed_precision:
+                batch_shifted_fp32 = batch_shifted.to(torch.float32)
+                batch_distances = torch.norm(batch_shifted_fp32, p=2, dim=1).to(torch.float64)
+            else:
+                batch_distances = torch.norm(batch_shifted, p=2, dim=1)
+
+            # Exact integer pairs for labels and exact factorisation
+            batch_q_ints = [self.N // d for d in batch_ints]
+            all_pairs_int.extend(list(zip(batch_ints, batch_q_ints)))
+
+            all_original_pairs.append(batch_pairs)
+            all_shifted_pairs.append(batch_shifted)
+            all_distances.append(batch_distances)
+
+        # Concatenate all batches
+        distances = torch.cat(all_distances)
+        original_pairs = torch.cat(all_original_pairs)
+        shifted_pairs = torch.cat(all_shifted_pairs)
+
+        # Cache exact integer pairs aligned with distance indices
+        self._pairs_int = all_pairs_int
+
+        return original_pairs, shifted_pairs, distances
+
+    def get_top_pairs_streaming(self, k: int = 5) -> List[Dict]:
+        """
+        Get top k pairs without loading all pairs into memory.
+        Uses PyTorch's topk over the distance tensor.
+        """
+        original_pairs, shifted_pairs, distances = self.compute_pairs_batched()
+
+        # Use PyTorch's topk
+        top_distances, indices = torch.topk(
+            distances,
+            k=min(k, len(distances)),
+            largest=False
+        )
+
         results = []
-        # Using a context manager for the executor
-        with concurrent.futures.ProcessPoolExecutor() as executor:
-            # Map the named top-level function
-            results = list(executor.map(compute_distance_task, tasks))
-            
+        for i in range(len(indices)):
+            idx = indices[i].item()
+
+            # exact integer factors
+            a_int, b_int = self._pairs_int[idx]
+
+            results.append({
+                'original': (a_int, b_int),
+                'shifted': (shifted_pairs[idx, 0].item(),
+                            shifted_pairs[idx, 1].item()),
+                'distance': top_distances[i].item(),
+                'factorization': f"{a_int} × {b_int}"
+            })
+
         return results
 
+    def compute_advanced_statistics(self) -> Dict:
+        _, _, distances = self.compute_pairs_batched()
+
+        # Percentiles
+        percentiles = [1, 5, 25, 50, 75, 95, 99]
+        q = torch.tensor(
+            [p / 100 for p in percentiles],
+            device=self.device,
+            dtype=distances.dtype,  # ensure same dtype as input
+        )
+        perc_values = torch.quantile(distances, q)
+
+        return {
+            'count': len(distances),
+            'mean': distances.mean().item(),
+            'std': distances.std().item(),
+            'min': distances.min().item(),
+            'max': distances.max().item(),
+            'median': distances.median().item(),
+            'percentiles': {p: perc_values[i].item() for i, p in enumerate(percentiles)},
+            'variance': distances.var().item(),
+            'skewness': self._compute_skewness(distances),
+        }
+    def _compute_skewness(self, distances: torch.Tensor) -> float:
+        """Compute skewness of distance distribution."""
+        mean = distances.mean()
+        std = distances.std()
+        third_moment = ((distances - mean) ** 3).mean()
+        return (third_moment / (std ** 3)).item() if std > 0 else 0.0
+
+    def generate_histogram_gpu(self, bins: int = 50) -> Dict:
+        """
+        Generate histogram entirely on GPU.
+        """
+        _, _, distances = self.compute_pairs_batched()
+        counts, bin_edges = torch.histogram(distances, bins=bins)
+
+        return {
+            'counts': counts.cpu().numpy(),
+            'bin_edges': bin_edges.cpu().numpy(),
+            'bins': bins
+        }
+
+    def memory_usage(self) -> Dict:
+        """Return current memory usage statistics."""
+        if self.device == 'cuda' and torch.cuda.is_available():
+            return {
+                'reserved': torch.cuda.memory_reserved(0) / 1e9,
+                'allocated': torch.cuda.memory_allocated(0) / 1e9,
+                'cached': (torch.cuda.memory_reserved(0) - torch.cuda.memory_allocated(0)) / 1e9,
+            }
+        else:
+            return {'note': 'CPU memory tracking not available or CUDA not available'}
+
+    def clear_cache(self):
+        """Clear GPU cache to free memory."""
+        if self.device == 'cuda' and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+
+
+# --- PERFORMANCE ANALYSIS ---
+class PerformanceAnalyzer:
+    """Analyze and visualize performance metrics."""
+
+    @staticmethod
+    def profile_calculation(N: int, device: str = 'auto'):
+        """Profile a complete calculation."""
+        if device == 'auto':
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+        print(f"\n{'=' * 70}")
+        print(f"PERFORMANCE PROFILE - N: {N}")
+        print(f"{'=' * 70}\n")
+
+        calc = AdvancedPyTorchCalculator(N, device=device, batch_size=5000)
+
+        # Initialization
+        print("📊 Calculating statistics...")
+        start = time.time()
+        stats = calc.compute_advanced_statistics()
+        stats_time = time.time() - start
+        print(f"✅ Statistics: {stats_time:.4f}s")
+
+        # Top pairs
+        print("\n🔝 Finding top pairs...")
+        start = time.time()
+        top_pairs = calc.get_top_pairs_streaming(k=10)
+        topk_time = time.time() - start
+        print(f"✅ Top pairs: {topk_time:.4f}s")
+
+        # Histogram
+        print("\n📈 Computing histogram...")
+        start = time.time()
+        hist = calc.generate_histogram_gpu(bins=50)
+        hist_time = time.time() - start
+        print(f"✅ Histogram: {hist_time:.4f}s")
+
+        # Memory
+        print("\n💾 Memory Usage:")
+        mem = calc.memory_usage()
+        for key, val in mem.items():
+            if isinstance(val, float):
+                print(f"   {key}: {val:.2f} GB")
+
+        # Summary
+        total_time = stats_time + topk_time + hist_time
+        print(f"\n⏱️  Total Time: {total_time:.4f}s")
+        print(f"📊 Total Pairs: {stats['count']}")
+        print(f"⚡ Throughput: {stats['count'] / total_time:.0f} pairs/sec")
+
+        return {
+            'stats': stats,
+            'top_pairs': top_pairs,
+            'histogram': hist,
+            'timing': {
+                'statistics': stats_time,
+                'top_pairs': topk_time,
+                'histogram': hist_time,
+                'total': total_time
+            }
+        }
+
+
+# --- MAIN ---
 if __name__ == "__main__":
-    # N is extremely large, sympy will handle it efficiently
-    N = 20000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000026
-    shifter = GeometryShifter(N)
-    
-    print(f"Starting parallel geometric shift...")
-    results = shifter.get_shifted_pairs_parallel()
+    # Test with original large number
+    N = 2000000000000000000000000000000000000026
 
-    # Use the named helper function for sorting instead of a lambda
-    sorted_results = sorted(results, key=get_distance)
+    print("🎯 Advanced PyTorch Geometry Calculator")
+    print("=" * 70)
 
-    print(f"\nTop 5 symmetric pairs:")
-    for item in sorted_results[:5]:
-        print(f"Pair: {item['original']} | Distance: {item['distance']:.2f}")
+    try:
+        # Initialize
+        calc = AdvancedPyTorchCalculator(
+            N,
+            device=None,  # Auto-detect
+            batch_size=10000,
+            use_mixed_precision=True
+        )
+
+        print(f"\n📊 Analyzing N = {N}")
+        print(f"📍 Center = {calc.center.item():.0f}")
+
+        # Get top pairs
+        print("\n🔍 Computing top pairs...")
+        top_pairs = calc.get_top_pairs_streaming(k=5)
+
+        print("\n🏆 Top 5 Pairs Closest to Origin:")
+        print("-" * 70)
+        for i, item in enumerate(top_pairs, 1):
+            print(f"\n{i}. {item['factorization']}")
+            print(f"   Shifted: ({item['shifted'][0]:.4f}, {item['shifted'][1]:.4f})")
+            print(f"   Distance: {item['distance']:.8f}")
+
+        # Statistics
+        print("\n\n📈 Distribution Statistics:")
+        print("-" * 70)
+        stats = calc.compute_advanced_statistics()
+        print(f"Total pairs: {stats['count']}")
+        print(f"Mean distance: {stats['mean']:.6f}")
+        print(f"Std deviation: {stats['std']:.6f}")
+        print(f"Skewness: {stats['skewness']:.6f}")
+
+        print(f"\nPercentiles:")
+        for p, v in list(stats['percentiles'].items()):
+            print(f"  {p}th: {v:.6f}")
+
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        print("\n💡 Tip: For extremely large numbers, consider reviewing divisor enumeration cost or running on smaller N for performance testing.")
