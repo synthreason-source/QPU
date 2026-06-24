@@ -1,408 +1,60 @@
-import torch
 import math
-import time
-from typing import Iterator, Dict, List, Tuple
-import numpy as np
+import concurrent.futures
+from sympy import divisors
 
+# --- TOP-LEVEL HELPER FUNCTIONS ---
+# These are easily picklable because they are at the module level.
 
-# ---- BIG INT UTILITIES (LIMB-BASED) ----
-
-BASE = 2 ** 32  # limb base (fits comfortably in int64)
-
-
-def int_to_limbs(N: int, base: int = BASE) -> list[int]:
-    if N < 0:
-        raise ValueError("int_to_limbs expects N >= 0")
-    if N == 0:
-        return [0]
-    limbs = []
-    n = N
-    while n > 0:
-        limbs.append(n % base)
-        n //= base
-    return limbs
-
-
-def auto_max_div(device: str, bytes_per_candidate: int = 8, safety_factor: float = 0.5,
-                  hard_cap: int = 50_000_000_000) -> int:
+def compute_distance_task(args):
     """
-    Pick the largest max_div that is safe to materialize as a CHUNK at a time
-    (not all at once -- candidates are generated batch_size at a time, so this
-    just caps the *search ceiling*, bounded by:
-      - int64 range (~9.2e18) -- effectively never the binding constraint
-      - a sane hard_cap, since brute-force trial division beyond ~1e10-1e11
-        stops being worth doing on CPU/GPU vs. real factoring algorithms
-      - available memory (informational only, since we chunk -- but used to
-        size the chunk batch_size sensibly elsewhere)
+    Unpacks arguments and computes distance.
+    This replaces the need for lambdas or partials.
     """
-    if device == "cuda" and torch.cuda.is_available():
-        free_bytes, _ = torch.cuda.mem_get_info()
-    else:
-        import psutil  # may not be installed; fallback below
-        try:
-            free_bytes = psutil.virtual_memory().available
-        except Exception:
-            free_bytes = 4 * 1024 ** 3  # assume 4GB if unknown
+    p, q, center = args
+    sp, sq = p - center, q - center
+    dist = math.sqrt(sp**2 + sq**2)
+    return {
+        "original": (p, q),
+        "shifted": (sp, sq),
+        "distance": dist
+    }
 
-    # We don't need free_bytes to cover the FULL range since we chunk it,
-    # but we use it to decide how big a single chunk can be, and we cap the
-    # overall search ceiling at hard_cap regardless of memory, because
-    # brute-force trial division beyond ~1e10-1e11 is not a sane use of time
-    # even if memory allows it.
-    return hard_cap
+def get_distance(item):
+    """Named helper for sorting."""
+    return item['distance']
 
+# --- GEOMETRY SHIFTER ---
+class GeometryShifter:
+    def __init__(self, N):
+        self.N = N
+        self.center = math.isqrt(N)
 
-# --- ADVANCED PYTORCH GEOMETRY CALCULATOR ---
-
-
-class AdvancedPyTorchCalculator:
-    """
-    GPU-centric calculator with:
-    - Arbitrary-precision N using limb representation on CUDA
-    - Divisor search on device in a *configured region*, generated in CHUNKS
-      so the candidate range itself never needs to be materialized in full
-      (this is what previously caused either an OverflowError, when the
-      region was built around sqrt(N) for a huge N, or an OOM, when max_div
-      was pushed very high).
-    - Batch processing and optional CUDA streams
-    - Mixed precision for norms
-
-    Design:
-    - N may be arbitrarily large (Python int).
-    - Divisors d are limited to int64 (search region must fit in that range,
-      which in practice is never the binding constraint -- memory and time
-      are).
-    - You choose which region is exhaustively searched.
-    """
-
-    def __init__(
-        self,
-        N: int,
-        device: str = None,
-        batch_size: int = 10_000_000,
-        use_mixed_precision: bool = True,
-        use_cuda_streams: bool = True,
-        divisor_mode: str = "full_up_to_B",  # or "band_around_sqrt"
-        max_div: int = None,                 # None => auto-maxed
-        band_width: int = 1_000_000,
-    ):
-        if N <= 0:
-            raise ValueError("Require N > 0.")
-        self.N = int(N)
-        self.batch_size = int(batch_size)
-        self.use_mixed_precision = bool(use_mixed_precision)
-        self.divisor_mode = divisor_mode
-        self.band_width = int(band_width)
-
-        if device is None:
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        else:
-            self.device = device
-        print(f"Device: {self.device}")
-
-        # --- "max it": auto-pick the largest sane search ceiling ---
-        if max_div is None:
-            self.max_div = auto_max_div(self.device)
-            print(f"max_div not given -> auto-maxed to {self.max_div:,}")
-        else:
-            self.max_div = int(max_div)
-
-        # Limb-based representation of N for big-int modulus on device
-        self.base = BASE
-        N_limbs_list = int_to_limbs(self.N, self.base)
-        self.N_limbs = torch.tensor(N_limbs_list, dtype=torch.int64, device=self.device)
-        self.num_limbs = self.N_limbs.numel()
-
-        N_float = float(self.N)
-        self.N_tensor = torch.tensor(N_float, dtype=torch.float64, device=self.device)
-
-        self.center_val = math.isqrt(self.N)
-        self.center = torch.tensor(self.center_val, dtype=torch.float64, device=self.device)
-
-        self.dtype = torch.float32 if self.use_mixed_precision else torch.float64
-
-        self.use_cuda_streams = (
-            use_cuda_streams and (self.device == "cuda") and torch.cuda.is_available()
-        )
-        if self.device == "cuda" and torch.cuda.is_available():
-            torch.cuda.set_per_process_memory_fraction(0.95)
-            self.stream = (
-                torch.cuda.Stream() if self.use_cuda_streams else torch.cuda.current_stream()
-            )
-            self._print_gpu_info()
-        else:
-            self.stream = None
-
-        self._pairs_int: List[Tuple[int, int]] = []
-
-        # Sanity check: if band_around_sqrt, the region must fit int64.
-        if self.divisor_mode == "band_around_sqrt":
-            INT64_MAX = 2**63 - 1
-            region_start = max(1, self.center_val - self.band_width)
-            region_end = self.center_val + self.band_width
-            if region_end > INT64_MAX or region_start > INT64_MAX:
-                raise OverflowError(
-                    f"band_around_sqrt region [{region_start}, {region_end}] does not "
-                    f"fit in int64 (max {INT64_MAX}). sqrt(N) has "
-                    f"{len(str(self.center_val))} digits -- this mode only works when "
-                    f"sqrt(N) itself is small enough to fit int64. For large N, use "
-                    f"divisor_mode='full_up_to_B' instead (brute trial division near 1), "
-                    f"or use a real factoring algorithm."
-                )
-
-    def _print_gpu_info(self):
-        props = torch.cuda.get_device_properties(0)
-        print(f"🚀 GPU: {props.name}")
-        print(f"   Memory: {props.total_memory / 1e9:.1f} GB")
-        print(f"   CUDA Capability: {props.major}.{props.minor}")
-
-    # ----------------------------------------------------------------------
-    # Big-int modulus: N mod d for many d, using limbs on CUDA
-    # ----------------------------------------------------------------------
-
-    def big_mod_batch(self, ds: torch.Tensor) -> torch.Tensor:
-        if ds.dtype != torch.int64:
-            ds = ds.to(torch.int64)
-        r = torch.zeros_like(ds, dtype=torch.int64, device=self.device)
-        base_t = torch.tensor(self.base, dtype=torch.int64, device=self.device)
-        for i in range(self.num_limbs - 1, -1, -1):
-            limb = self.N_limbs[i]
-            r = (r * base_t + limb) % ds
-        return r
-
-    # ----------------------------------------------------------------------
-    # CHUNKED candidate generation -- never materializes the full range
-    # ----------------------------------------------------------------------
-
-    def _candidate_bounds(self) -> Tuple[int, int]:
-        if self.divisor_mode == "full_up_to_B":
-            start, end = 1, self.max_div
-        elif self.divisor_mode == "band_around_sqrt":
-            c = self.center_val
-            start = max(1, c - self.band_width)
-            end = c + self.band_width
-        else:
-            raise ValueError(f"Unknown divisor_mode: {self.divisor_mode}")
-        if end < start:
-            raise ValueError(f"Invalid candidate range [{start}, {end}]")
-        return start, end
-
-    def _iter_candidate_chunks(self) -> Iterator[torch.Tensor]:
-        """
-        Yields int64 tensors of at most self.batch_size candidates at a time,
-        WITHOUT ever building the full [start, end] range in memory.
-        """
-        start, end = self._candidate_bounds()
-        total = end - start + 1
-        print(f"Divisor search region: [{start}, {end}] (size={total:,}), "
-              f"chunked at {self.batch_size:,} per batch")
-        cur = start
-        while cur <= end:
-            chunk_end = min(cur + self.batch_size - 1, end)
-            yield torch.arange(cur, chunk_end + 1, dtype=torch.int64, device=self.device)
-            cur = chunk_end + 1
-
-    def _gpu_divisors(self) -> torch.Tensor:
-        divs_chunks = []
-        n_checked = 0
-        t0 = time.time()
-        for batch_ds in self._iter_candidate_chunks():
-            remainders = self.big_mod_batch(batch_ds)
-            mask = (remainders == 0)
-            if mask.any():
-                found = batch_ds[mask]
-                divs_chunks.append(found)
-                print(f"  found {found.numel()} divisor(s) in this chunk "
-                      f"(running total checked: {n_checked + batch_ds.numel():,})")
-            n_checked += batch_ds.numel()
-
-        elapsed = time.time() - t0
-        print(f"Checked {n_checked:,} candidates in {elapsed:.2f}s "
-              f"({n_checked/max(elapsed,1e-9):,.0f}/s)")
-
-        if not divs_chunks:
-            raise RuntimeError(
-                "No divisors found for N in the configured region. "
-                "You are not missing pairs within that region; "
-                "consider widening it if needed (or use a real factoring "
-                "algorithm if N's smallest factor exceeds max_div)."
-            )
-
-        divs = torch.cat(divs_chunks)
-        print(f"Found {divs.numel()} divisors in search region.")
-        return divs
-
-    def get_divisors_batch(self) -> Iterator[Tuple[List[int], torch.Tensor]]:
-        divs_int64 = self._gpu_divisors()
-        divs_float64 = divs_int64.to(torch.float64)
-        divs_int_list = divs_int64.cpu().tolist()
-        for i in range(0, len(divs_int_list), self.batch_size):
-            batch_ints = divs_int_list[i : i + self.batch_size]
-            batch_tensor = divs_float64[i : i + self.batch_size]
-            yield batch_ints, batch_tensor
-
-    # ----------------------------------------------------------------------
-    # Pair geometry and distances
-    # ----------------------------------------------------------------------
-
-    def compute_pairs_batched(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        all_distances = []
-        all_shifted_pairs = []
-        all_original_pairs = []
-        all_pairs_int: List[Tuple[int, int]] = []
-
-        print("📦 Processing divisors in batches...")
-
-        if self.use_cuda_streams:
-            ctx = torch.cuda.stream(self.stream)
-        else:
-            class _NullCtx:
-                def __enter__(self_s): return None
-                def __exit__(self_s, *exc): return False
-            ctx = _NullCtx()
-
-        with ctx:
-            for batch_ints, batch_divs in self.get_divisors_batch():
-                batch_q = self.N_tensor / batch_divs
-                batch_pairs = torch.stack([batch_divs, batch_q], dim=1)
-                batch_shifted = batch_pairs - self.center
-
-                if self.use_mixed_precision:
-                    batch_shifted_fp32 = batch_shifted.to(torch.float32)
-                    batch_distances = (
-                        torch.norm(batch_shifted_fp32, p=2, dim=1).to(torch.float64)
-                    )
-                else:
-                    batch_distances = torch.norm(batch_shifted, p=2, dim=1)
-
-                batch_q_ints = [self.N // d for d in batch_ints]
-                all_pairs_int.extend(zip(batch_ints, batch_q_ints))
-
-                all_original_pairs.append(batch_pairs)
-                all_shifted_pairs.append(batch_shifted)
-                all_distances.append(batch_distances)
-
-        if self.use_cuda_streams:
-            self.stream.synchronize()
-
-        distances = torch.cat(all_distances)
-        original_pairs = torch.cat(all_original_pairs)
-        shifted_pairs = torch.cat(all_shifted_pairs)
-
-        self._pairs_int = all_pairs_int
-
-        return original_pairs, shifted_pairs, distances
-
-    # ----------------------------------------------------------------------
-    # Top-k, stats, histogram
-    # ----------------------------------------------------------------------
-
-    def get_top_pairs_streaming(self, k: int = 5) -> List[Dict]:
-        original_pairs, shifted_pairs, distances = self.compute_pairs_batched()
-        top_distances, indices = torch.topk(distances, k=min(k, len(distances)), largest=False)
+    def get_shifted_pairs_parallel(self):
+        divs = sorted(divisors(self.N))
+        pairs = [(d, self.N // d) for d in divs]
+        
+        # Prepare list of arguments as simple tuples
+        tasks = [(p, q, self.center) for p, q in pairs]
+        
         results = []
-        for i in range(len(indices)):
-            idx = indices[i].item()
-            a_int, b_int = self._pairs_int[idx]
-            results.append({
-                "original": (a_int, b_int),
-                "shifted": (shifted_pairs[idx, 0].item(), shifted_pairs[idx, 1].item()),
-                "distance": top_distances[i].item(),
-                "factorization": f"{a_int} × {b_int}",
-            })
+        # Using a context manager for the executor
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            # Map the named top-level function
+            results = list(executor.map(compute_distance_task, tasks))
+            
         return results
 
-    def compute_advanced_statistics(self) -> Dict:
-        _, _, distances = self.compute_pairs_batched()
-        percentiles = [1, 5, 25, 50, 75, 95, 99]
-        q = torch.tensor([p / 100.0 for p in percentiles], device=self.device, dtype=distances.dtype)
-        perc_values = torch.quantile(distances, q)
-        return {
-            "count": len(distances),
-            "mean": distances.mean().item(),
-            "std": distances.std().item(),
-            "min": distances.min().item(),
-            "max": distances.max().item(),
-            "median": distances.median().item(),
-            "percentiles": {p: perc_values[i].item() for i, p in enumerate(percentiles)},
-            "variance": distances.var().item(),
-            "skewness": self._compute_skewness(distances),
-        }
-
-    def _compute_skewness(self, distances: torch.Tensor) -> float:
-        mean = distances.mean()
-        std = distances.std()
-        if std == 0:
-            return 0.0
-        third_moment = ((distances - mean) ** 3).mean()
-        return (third_moment / (std ** 3)).item()
-
-    def generate_histogram_gpu(self, bins: int = 50) -> Dict:
-        _, _, distances = self.compute_pairs_batched()
-        counts, bin_edges = torch.histogram(distances, bins=bins)
-        return {"counts": counts.cpu().numpy(), "bin_edges": bin_edges.cpu().numpy(), "bins": bins}
-
-    def memory_usage(self) -> Dict:
-        if self.device == "cuda" and torch.cuda.is_available():
-            return {
-                "reserved": torch.cuda.memory_reserved(0) / 1e9,
-                "allocated": torch.cuda.memory_allocated(0) / 1e9,
-                "cached": (torch.cuda.memory_reserved(0) - torch.cuda.memory_allocated(0)) / 1e9,
-            }
-        else:
-            return {"note": "CPU memory tracking only; CUDA not available"}
-
-    def clear_cache(self):
-        if self.device == "cuda" and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
-
-
-# --- MAIN ---
-
 if __name__ == "__main__":
-    N = int(
-        "1245175658322065101091042051519684568641567082354062426786500358082701538479264551"
-        "2825119917593801220771759080837419917349093911062382127898774301312562252355276726"
-        "82477151190236980507728955305135218114149237202174488831144761104819"
-    )
+    # N is extremely large, sympy will handle it efficiently
+    N = 20000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000026
+    shifter = GeometryShifter(N)
+    
+    print(f"Starting parallel geometric shift...")
+    results = shifter.get_shifted_pairs_parallel()
 
-    print("🎯 Advanced CUDA-Driven Geometry Calculator (Big-Int N) -- MAXED")
-    print("=" * 70)
+    # Use the named helper function for sorting instead of a lambda
+    sorted_results = sorted(results, key=get_distance)
 
-    try:
-        # For an N this large, band_around_sqrt cannot work (sqrt(N) has ~350
-        # digits and won't fit int64), so this script forces full_up_to_B and
-        # auto-maxes max_div to the largest sane brute-force ceiling.
-        calc = AdvancedPyTorchCalculator(
-            N,
-            device=None,
-            batch_size=100_000_000,   # chunk size actually checked at once
-            use_mixed_precision=True,
-            use_cuda_streams=True,
-            divisor_mode="full_up_to_B",
-            max_div=None,             # auto-maxed
-        )
-
-        print(f"\n📊 Analyzing N (bit length={N.bit_length()})")
-        print(f"📍 Center ≈ sqrt(N) = {calc.center.item():.3e}")
-
-        print("\n🔍 Computing top pairs...")
-        top_pairs = calc.get_top_pairs_streaming(k=5)
-
-        print("\n🏆 Top 5 Pairs Closest to Origin:")
-        print("-" * 70)
-        for i, item in enumerate(top_pairs, 1):
-            print(f"\n{i}. {item['factorization']}")
-            print(f"   Shifted: ({item['shifted'][0]:.4f}, {item['shifted'][1]:.4f})")
-            print(f"   Distance: {item['distance']:.8f}")
-
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        print(
-            "\n💡 Tip: brute-force trial division up to even 50 billion will only "
-            "ever find divisors that small. For a 700-digit N, that is astronomically "
-            "unlikely to hit anything. If N doesn't have a small factor, no value of "
-            "max_div fixes that -- you need a real factoring algorithm (Pollard's rho, "
-            "ECM, etc.) instead of brute force."
-        )
+    print(f"\nTop 5 symmetric pairs:")
+    for item in sorted_results[:5]:
+        print(f"Pair: {item['original']} | Distance: {item['distance']:.2f}")
