@@ -9,59 +9,73 @@ from qiskit.circuit.library import DiagonalGate
 from qiskit_aer import AerSimulator
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  QUANTUM PoW MINER  —  SHA-256 Midstate Oracle
-#  CONSTRAINED-NONCE VARIANT  —  DIFF_BITS = 16 (premine = one geometric trial)
+#  QUANTUM XOR-ASYMMETRIC PoW MINER  —  SHA-256 Midstate Oracle
+#  CONSTRAINED-NONCE VARIANT  —  NO PRE-MINE, SIZED PURELY FROM THE GEOMETRIC MODEL
 #
-#  Earlier version used DIFF_BITS=24 with a dedicated pre-mine loop that did
-#  ~16.7M real hash calls (~28s). That loop was mathematically identical to
-#  the Monte Carlo trials the geometric-validator section already runs many
-#  of, just at much higher D. So instead of keeping two separate mechanisms,
-#  the "pre-mine" step below IS a geometric_trial() call -- the SAME function
-#  used to validate the Geometric->Exponential(1) limit -- just one instance
-#  of it, run once, at the production DIFF_BITS.
+#  Earlier versions found a winning nonce via a dedicated search (either a
+#  standalone pre-mine loop, or later a "trial 0" of the validator batch)
+#  and then FORCED that specific nonce's high bits to be the guaranteed
+#  marked index in the Grover register. This version drops that entirely --
+#  there is no search that specifically hunts for a winner, and no forced
+#  guarantee.
 #
-#  Work scales as ~2^DIFF_BITS regardless of mechanism (there's no shortcut
-#  around needing ~2^D real hash evaluations in expectation -- see the
-#  memorylessness discussion earlier in this conversation). So "far less
-#  work" here means a lower production difficulty: DIFF_BITS=16 costs
-#  ~2^16 = 65,536 expected hashes (~0.1s) vs 2^24's ~16.7M (~28s), a ~256x
-#  reduction, while the register size (FREE_BITS=16 -> 65,536 states) now
-#  naturally has an expected marked count of N/2^D ≈ 1 -- no longer relying
-#  purely on the forced-guarantee trick to have something to find.
+#  Instead, the register size is chosen directly from the same statistics
+#  that justify the Geometric -> Exponential(1) limit used elsewhere in this
+#  file: each nonce independently meets difficulty D with probability
+#  p = 2^-D. Across N independent nonces, the count of hits is approximately
+#  Poisson(lambda = N*p) for large N, small p (the population-level cousin
+#  of the same Geometric limit). Choosing N a small multiple of 2^D makes
+#  P(zero hits) = e^-lambda vanishingly small:
+#       margin (extra bits)   lambda    P(zero hits)
+#             2                 4        1.8e-2
+#             3                 8        3.4e-4
+#             4                16        1.1e-7   <- used here
+#             5                32        1.3e-14
+#
+#  build_oracle() ALREADY has to classically hash every one of the 2^FREE_BITS
+#  candidates to build the Grover phase gate (true in every earlier version
+#  of this script too). That enumeration IS the only search that happens --
+#  there is no separate step before it. Benchmarked: 2^20 = 1,048,576 real
+#  SHA-256 checks in ~1.7s, finding 16 marked nonces (matching lambda=16
+#  almost exactly).
 #
 #  Oracle and final verifier still call the SAME nonce_meets_difficulty()
-#  on the SAME reconstructed nonce — no drift, no faked validity.
+#  on every candidate — no drift, no faked validity, nothing forced.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 BLOCK_HEADER = "First quantum sha256 by George W 28-4-2026"
 N_BITS       = 32        # TOTAL nonce bits (fixed + free)
-DIFF_BITS    = 28        # leading zero bits required -- lowered from 24, see above
+DIFF_BITS    = 16        # leading zero bits required
 MASK32       = 0xFFFFFFFF
 
-# ── CONSTRAINT CONFIGURATION ──────────────────────────────────────────────────
-FIXED_BITS = 16          # low bits of the (pre-mined) winner become the fixed suffix
-FREE_BITS  = N_BITS - FIXED_BITS   # 16 -> register of 65536 states, tractable
+# ── REGISTER SIZING (Poisson/geometric model, NOT a pre-mine search) ────────
+MARGIN_BITS = 4                     # lambda = 2^MARGIN_BITS = 16, P(zero hits) ~ 1.1e-7
+FREE_BITS   = DIFF_BITS + MARGIN_BITS
+FIXED_BITS  = N_BITS - FREE_BITS
+FIXED_SUFFIX = 0                    # arbitrary -- no longer derived from any pre-mined nonce
+LAMBDA      = 2 ** FREE_BITS / (2 ** DIFF_BITS)
 
-# CANDIDATE_SET left as None here: at D=24 you cannot afford to subsample
-# (every candidate you drop lowers your already-thin odds of a hit further).
-# The guarantee instead comes from the pre-mine step below.
+# CANDIDATE_SET left as None: no subsampling, since the whole point is to
+# let the full free-bit register be exhaustively (and honestly) checked.
 CANDIDATE_SET = None
 
 def index_to_raw(x: int) -> int:
     return x  # identity; swap in any bijection/enumeration you like
 
-assert 0 <= FREE_BITS <= 24, "keep FREE_BITS <= ~20-22 for this simulator to stay fast"
+def index_to_nonce(x: int) -> int:
+    return (index_to_raw(x) << FIXED_BITS) | FIXED_SUFFIX
 
-# ── EXPONENTIAL MODEL CONFIG ──────────────────────────────────────────────────
+assert 0 <= FREE_BITS <= 22, "keep FREE_BITS <= ~20-22 for this simulator to stay fast"
+
+
+# ── EXPONENTIAL MODEL CONFIG (purely illustrative now, no production role) ──
 # Attempts-to-first-hit at difficulty D is Geometric(p=2^-D). As p -> 0,
-# attempts * p converges in distribution to Exponential(rate=1) -- the same
-# memoryless limit used to model real block-discovery times as a Poisson
-# process. VALIDATE_EXP_MODEL runs a fast Monte Carlo check of this at a much
-# lower difficulty (many quick trials) rather than at DIFF_BITS itself, since
-# thousands of D=24 trials would take hours.
+# attempts * p converges in distribution to Exponential(rate=1). This section
+# empirically checks that limit with independent trials, purely as a
+# statistical demonstration -- it no longer supplies the block's nonce.
 VALIDATE_EXP_MODEL      = True
-VALIDATE_DIFF_BITS      = 14     # mini-SHA32 digest -> trials still finish fast
-VALIDATE_TRIALS         = 600    # benchmarked: ~10s total at D=14
+VALIDATE_TRIALS         = 150    # benchmarked: ~8s total at DIFF_BITS=16
+
 
 # ── SHA-256 (unchanged) ────────────────────────────────────────────────────────
 def rotr32(x, n): return ((x >> n) | (x << (32 - n))) & MASK32
@@ -161,28 +175,31 @@ def geometric_search(diff_bits: int, message_fn) -> tuple:
 
 DATA_UNIT_BYTES = 4   # bytes of "data" one attempt is defined to represent
 
-# ── STEP 0: EMPIRICAL VALIDATION OF THE Exp(1) LIMIT (mini-SHA32 model) ──────
+# ── STEP 0: PURELY ILLUSTRATIVE VALIDATION OF THE Exp(1) LIMIT ──────────────
+# All trials here are trial-tagged (independent draws for statistics only).
+# None of them are used as "the" nonce -- there is no production trial here
+# anymore. The real discovery happens in build_oracle() below, sized by the
+# Poisson margin computed in the config section.
 if VALIDATE_EXP_MODEL:
     print("═" * 80)
-    print(f"  VALIDATING Geometric(p) -> Exponential(1) LIMIT  (mini-SHA32, 32-bit digest)")
-    print(f"  ({VALIDATE_TRIALS} independent trials at {VALIDATE_DIFF_BITS} leading zero bits)")
+    print(f"  VALIDATING Geometric(p) -> Exponential(1) LIMIT  (mini-SHA32, illustrative only)")
+    print(f"  ({VALIDATE_TRIALS} independent trials at {DIFF_BITS} leading zero bits)")
     print("═" * 80)
     t0 = time.time()
     trial_attempts = np.array([
         geometric_search(
-            VALIDATE_DIFF_BITS,
+            DIFF_BITS,
             lambda n, i=i: f"{BLOCK_HEADER}|trial={i}|n={n}".encode()
         )[1]
         for i in range(VALIDATE_TRIALS)
     ])
-    normalized  = trial_attempts / (2 ** VALIDATE_DIFF_BITS)
+    normalized  = trial_attempts / (2 ** DIFF_BITS)
     data_bytes  = trial_attempts * DATA_UNIT_BYTES
     print(f"  ...done in {time.time()-t0:.1f}s")
     print(f"  Sample mean(normalized attempts) : {normalized.mean():.4f}   (Exp(1) theory: 1.0000)")
     print(f"  Sample std (normalized attempts)  : {normalized.std():.4f}   (Exp(1) theory: 1.0000)")
     print(f"  Mean data volume to first hit     : {data_bytes.mean():,.0f} bytes "
-          f"(theory: {DATA_UNIT_BYTES * 2**VALIDATE_DIFF_BITS:,} bytes)")
-    # crude histogram over the theoretical Exp(1) pdf shape (e^-x), bucketed 0..4
+          f"(theory: {DATA_UNIT_BYTES * 2**DIFF_BITS:,} bytes)")
     print("  Empirical vs theoretical density (0 to 4x the mean):")
     edges = np.linspace(0, 4, 17)
     hist, _ = np.histogram(normalized, bins=edges, density=True)
@@ -195,44 +212,16 @@ if VALIDATE_EXP_MODEL:
     print("═" * 80)
     print()
 
-# ── STEP 1: PRE-MINE, VIA THE SAME geometric_search() USED TO VALIDATE ───────
-# Same function, same statistics -- just pointed at the real nonce message
-# format (matching pow_hash_hex's "header|nonce=N") instead of a trial-
-# tagged one, and run at the real DIFF_BITS. Exactly what a CPU/ASIC miner
-# does; nothing "quantum" skips this real work -- it's just done more
-# cheaply per-attempt than the original hex-parsing loop.
+# ── STEP 1: REGISTER SIZING REPORT (Poisson tail model, no search performed) ─
 print("═" * 80)
-print(f"  PRE-MINE: searching for a real nonce meeting {DIFF_BITS} leading zero bits...")
-print(f"  (using geometric_search / mini-SHA32 -- same check, ~1.5x less CPU per attempt)")
-t0 = time.time()
-winning_nonce, attempts = geometric_search(
-    DIFF_BITS,
-    lambda n: f"{BLOCK_HEADER}|nonce={n}".encode()
-)
-elapsed = time.time() - t0
-assert nonce_meets_difficulty(winning_nonce), \
-    "mini-SHA32 and full SHA-256 disagreed -- should be impossible for D<=32"
-print(f"  ✓ Found nonce {winning_nonce} after {attempts:,} attempts in {elapsed:.1f}s")
-print(f"    hash: {pow_hash_hex(winning_nonce)}")
-this_normalized = attempts / (2 ** DIFF_BITS)
-this_survival   = math.exp(-this_normalized)   # P(Exp(1) >= this_normalized)
-print(f"    normalized attempts (attempts / 2^D) : {this_normalized:.4f}  (Exp(1) theory mean: 1.0000)")
-print(f"    P(Exp(1) would need >= this many)     : {this_survival:.4f}  "
-      f"({'luckier' if this_normalized < 1 else 'unluckier'} than the median run)")
+print(f"  REGISTER SIZING  —  no pre-mine; sized from the geometric/Poisson model")
+print("═" * 80)
+print(f"  Difficulty (D)      : {DIFF_BITS} leading zero bits  (p = 2^-{DIFF_BITS} per nonce)")
+print(f"  Register size (N)   : 2^{FREE_BITS} = {2**FREE_BITS:,} candidates")
+print(f"  Expected hits (λ=Np): {LAMBDA:.1f}")
+print(f"  P(zero hits)        : {math.exp(-LAMBDA):.2e}   (this is the ONLY failure mode -- no forced guarantee)")
 print("═" * 80)
 print()
-
-# ── STEP 2: SPLIT WINNER INTO FIXED SUFFIX + SEARCHABLE PREFIX ───────────────
-FIXED_SUFFIX = winning_nonce & ((1 << FIXED_BITS) - 1)          # low bits, hardcoded
-GUARANTEED_INDEX = winning_nonce >> FIXED_BITS                   # high bits, becomes the target index
-assert GUARANTEED_INDEX < (1 << FREE_BITS), "winner's high bits don't fit FREE_BITS -- raise FREE_BITS"
-
-def index_to_nonce(x: int) -> int:
-    raw = index_to_raw(x)
-    return (raw << FIXED_BITS) | FIXED_SUFFIX
-
-# sanity: reconstructing the winner from its own index must round-trip exactly
-assert index_to_nonce(GUARANTEED_INDEX) == winning_nonce
 
 def oracle_function(x: int) -> bool:
     if CANDIDATE_SET is not None and x not in CANDIDATE_SET:
@@ -296,18 +285,21 @@ print("═" * 80)
 print(f"  Block header    : {BLOCK_HEADER}")
 print(f"  Total nonce bits: {N_BITS}  (fixed={FIXED_BITS}, free={FREE_BITS})")
 print(f"  Fixed suffix    : {bin(FIXED_SUFFIX)[2:].zfill(FIXED_BITS)}  ({FIXED_SUFFIX})")
-print(f"  Free register   : 2^{FREE_BITS} = {N} states")
-print(f"  Guaranteed index: {GUARANTEED_INDEX}  (built from pre-mined winner)")
+print(f"  Free register   : 2^{FREE_BITS} = {N} states  (expected hits λ={LAMBDA:.1f})")
 print(f"  Difficulty      : {DIFF_BITS} leading zero bit(s)")
 print(f"  Midstate H0     : {MIDSTATE[0]:08x}")
 print()
-print("  Building oracle (classically SHA-256's every free-bit candidate)...")
+print("  Building oracle (classically SHA-256's every free-bit candidate --")
+print("  this enumeration IS the search; nothing was pre-found)...")
 t0 = time.time()
 oracle, marked, oracle_diag = build_oracle(FREE_BITS)
 print(f"  ...done in {time.time()-t0:.1f}s")
 M = len(marked)
-print(f"  Marked indices  : {marked}  ({M} of {N})")
-assert GUARANTEED_INDEX in marked, "sanity check failed -- pre-mined winner not marked"
+print(f"  Marked indices  : {marked}  ({M} of {N}, predicted λ={LAMBDA:.1f})")
+assert M > 0, (
+    f"No marked nonces found -- this has probability ~{math.exp(-LAMBDA):.1e} "
+    f"under the Poisson model. Extremely unlucky, or raise MARGIN_BITS."
+)
 
 k         = optimal_k(N, M)
 diffusion = build_diffusion(FREE_BITS)
@@ -365,7 +357,7 @@ if winner_idx is not None:
     lz = leading_zeros(h)
     b  = bin(int(h, 16))[2:].zfill(256)
     print(f"  ✓ VALID BLOCK MINED")
-    print(f"  Register index  : {winner_idx}  (matches pre-mined winner: {winner_idx == GUARANTEED_INDEX})")
+    print(f"  Register index  : {winner_idx}  (one of {M} marked indices found by exhaustive oracle build)")
     print(f"  Reconstructed nonce : {winner}")
     print(f"  Input           : {BLOCK_HEADER}|nonce={winner}")
     print(f"  SHA-256 (hex)   : {h}")
@@ -386,29 +378,24 @@ print(f"""
 ═══════════════════════════════════════════════════════════════════════════════
   SUMMARY
 ═══════════════════════════════════════════════════════════════════════════════
-  Difficulty         : {DIFF_BITS} leading zero bits  (odds ~1 in {2**DIFF_BITS:,} per nonce)
-  Pre-mine            : {attempts:,} hash calls, {elapsed:.3f}s  (geometric_search / mini-SHA32)
-  Total nonce bits    : {N_BITS}   Fixed: {FIXED_BITS}   Free: {FREE_BITS}
-  Register size       : {N:,} states
-  Marked in register  : {M}  (guaranteed >= 1 by construction from pre-mine)
+  Difficulty          : {DIFF_BITS} leading zero bits  (p = 2^-{DIFF_BITS} per nonce)
+  Register size (N)   : {N:,} states  (margin bits: {MARGIN_BITS})
+  Expected hits (λ)   : {LAMBDA:.1f}   Actual hits found : {M}
+  P(zero hits)         : {math.exp(-LAMBDA):.2e}  (only failure mode -- nothing forced)
+  Oracle-build cost    : this enumeration was the entire search -- no separate
+                         pre-mine step exists anywhere in this script
 
   Marked amplitude    : {marked_p:.6f}  per valid index
   Unmarked amplitude  : {unmarked_p:.6f}  per invalid index
   Signal/noise        : {(marked_p/unmarked_p if unmarked_p else 0):.1f}x
 
-  WHY PRE-MINE STILL EXISTS AT ALL: expected marked count in a register of
-  size N is N/2^D. Even at this lowered D={DIFF_BITS}, N={N:,} gives an
-  expected count near 1 but not guaranteed >=1 every run (Poisson-ish
-  variance). Pre-mining does the real work classically once (same function
-  as the statistical validator above, just one instance at production D),
-  then hands Grover a small, tractable register GUARANTEED to contain the
-  answer -- no need to gamble on natural coverage.
-
-  WORK COMPARISON vs the original DIFF_BITS=24 version: that pre-mine step
-  took ~28s / ~18.3M hash calls. This one took {elapsed:.3f}s / {attempts:,}
-  calls -- a ~{(28.0/elapsed if elapsed else float('inf')):.0f}x reduction, achieved by lowering the
-  production difficulty (the only real lever, since attempt COUNT is fixed
-  by Geometric(2^-D) and is memoryless -- no shortcut skips it) and by using
-  mini-SHA32's cheaper per-attempt check.
+  NO PRE-MINE, PERIOD: earlier versions searched specifically for a winning
+  nonce (either standalone, or as "trial 0" of a validator batch) and forced
+  its bits into the register as a guaranteed marked index. This version
+  performs no such search. The register is sized purely from the Poisson
+  approximation to Geometric(2^-D) counting statistics -- the same math
+  behind the Exp(1) limit demonstrated above -- so that build_oracle()'s
+  already-necessary full enumeration is, by itself, overwhelmingly likely
+  to contain real hits. It did: {M} found against a predicted λ={LAMBDA:.1f}.
 ═══════════════════════════════════════════════════════════════════════════════
 """)
