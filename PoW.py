@@ -9,7 +9,7 @@ from qiskit.circuit.library import DiagonalGate
 from qiskit_aer import AerSimulator
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  QUANTUM XOR-ASYMMETRIC PoW MINER  —  SHA-256 Midstate Oracle
+#  QUANTUM PoW MINER  —  SHA-256 Midstate Oracle
 #  CONSTRAINED-NONCE VARIANT  —  NO PRE-MINE, SIZED PURELY FROM THE GEOMETRIC MODEL
 #
 #  Earlier versions found a winning nonce via a dedicated search (either a
