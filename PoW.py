@@ -174,44 +174,6 @@ def geometric_search(diff_bits: int, message_fn) -> tuple:
         n += 1
 
 DATA_UNIT_BYTES = 4   # bytes of "data" one attempt is defined to represent
-
-# ── STEP 0: PURELY ILLUSTRATIVE VALIDATION OF THE Exp(1) LIMIT ──────────────
-# All trials here are trial-tagged (independent draws for statistics only).
-# None of them are used as "the" nonce -- there is no production trial here
-# anymore. The real discovery happens in build_oracle() below, sized by the
-# Poisson margin computed in the config section.
-if VALIDATE_EXP_MODEL:
-    print("═" * 80)
-    print(f"  VALIDATING Geometric(p) -> Exponential(1) LIMIT  (mini-SHA32, illustrative only)")
-    print(f"  ({VALIDATE_TRIALS} independent trials at {DIFF_BITS} leading zero bits)")
-    print("═" * 80)
-    t0 = time.time()
-    trial_attempts = np.array([
-        geometric_search(
-            DIFF_BITS,
-            lambda n, i=i: f"{BLOCK_HEADER}|trial={i}|n={n}".encode()
-        )[1]
-        for i in range(VALIDATE_TRIALS)
-    ])
-    normalized  = trial_attempts / (2 ** DIFF_BITS)
-    data_bytes  = trial_attempts * DATA_UNIT_BYTES
-    print(f"  ...done in {time.time()-t0:.1f}s")
-    print(f"  Sample mean(normalized attempts) : {normalized.mean():.4f}   (Exp(1) theory: 1.0000)")
-    print(f"  Sample std (normalized attempts)  : {normalized.std():.4f}   (Exp(1) theory: 1.0000)")
-    print(f"  Mean data volume to first hit     : {data_bytes.mean():,.0f} bytes "
-          f"(theory: {DATA_UNIT_BYTES * 2**DIFF_BITS:,} bytes)")
-    print("  Empirical vs theoretical density (0 to 4x the mean):")
-    edges = np.linspace(0, 4, 17)
-    hist, _ = np.histogram(normalized, bins=edges, density=True)
-    for i, h_emp in enumerate(hist):
-        mid = (edges[i] + edges[i+1]) / 2
-        h_theory = math.exp(-mid)
-        bar_emp = '█' * int(h_emp * 12)
-        bar_th  = '·' * int(h_theory * 12)
-        print(f"    x={mid:4.2f}  emp {h_emp:5.2f} {bar_emp:<14}  theory {h_theory:5.2f} {bar_th}")
-    print("═" * 80)
-    print()
-
 # ── STEP 1: REGISTER SIZING REPORT (Poisson tail model, no search performed) ─
 print("═" * 80)
 print(f"  REGISTER SIZING  —  no pre-mine; sized from the geometric/Poisson model")
