@@ -1,1 +1,0 @@
-regarding quantum algorithms: The results will always be asymmetric 100% of the time and if there is only one correct solution and you didn't input it, you have 1/2 the attempts of guessing until correct. :D
