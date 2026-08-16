@@ -39,7 +39,7 @@ def optical_mac_reference(A, B):
 #    table that will later be pushed through the optical MAC).
 # ----------------------------------------------------------------------
 
-with open(input("Dataset filename: "), 'r', encoding='utf-8') as f:
+with open(input("Dataset filename:"), 'r', encoding='utf-8') as f:
     CORPUS = f.read()
 
 def tokenize(text):
@@ -156,40 +156,6 @@ def run():
     print("\nSeed context:", seed_context)
     print("Generated (token indices derived ONLY from optical_mac_reference output):")
     print(" ".join(generated))
-
-    # Show one worked example: distribution + optical MAC channel stack
-    A, seen = context_to_onehot(seed_context, context_to_idx)
-    filters_A = np.ones_like(A)
-    filters_B = np.ones_like(B)
-    A_enc = encode_same_plane(A, filters_A)
-    B_enc = encode_same_plane(B, filters_B)
-    optical_C, channels = optical_mac_reference(A_enc, B_enc)
-    top_idx = int(np.argmax(optical_C[0]))
-    print(f"\nFor context {seed_context}, optical MAC argmax token index = {top_idx} "
-          f"-> word '{vocab[top_idx]}'")
-
-    # ------------------------------------------------------------
-    # Diagnostic figure
-    # ------------------------------------------------------------
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
-
-    im0 = axes[0].imshow(B, aspect="auto", cmap="viridis")
-    axes[0].set_title("Digital trigram transition matrix B\n(context rows x vocab cols)")
-    axes[0].set_xlabel("vocab index")
-    axes[0].set_ylabel("context index")
-    fig.colorbar(im0, ax=axes[0], shrink=0.8)
-
-    im1 = axes[1].imshow(optical_C, aspect="auto", cmap="inferno")
-    axes[1].set_title(f"Optical MAC output for context {seed_context}\n(1 x vocab)")
-    axes[1].set_xlabel("vocab index")
-    axes[1].set_yticks([])
-    fig.colorbar(im1, ax=axes[1], shrink=0.8)
-
-    fig.suptitle("Trigram LLM: token index derived only from optical_mac_reference()")
-    fig.savefig("trigram_optical_mac.png", dpi=140, bbox_inches="tight")
-    plt.close(fig)
-
-    print("\nSaved figure to trigram_optical_mac.png")
 
     return {
         "vocab": vocab,
