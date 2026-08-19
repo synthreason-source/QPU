@@ -778,8 +778,7 @@ def interactive_program():
         name, val = pair.split("=", 1)
         values[name.strip()] = int(val.strip())
 
-    print("Enter your program, blank line to run it:")
-    lines = []
+   
     with open(input("Filename: "), 'r') as file:
     	# Read the entire content of the file
     	code = file.read()
