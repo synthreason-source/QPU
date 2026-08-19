@@ -858,12 +858,7 @@ if __name__ == "__main__":
 	----------------------
 	""")
 
-    if "--interactive" in sys.argv or "-i" in sys.argv:
-        interactive_eval()
-        raise SystemExit(0)
 
-    if "--program" in sys.argv or "-p" in sys.argv:
-        interactive_program()
-        raise SystemExit(0)
+    interactive_program()
 
    
