@@ -783,7 +783,9 @@ def interactive_program():
     with open(input("Filename: "), 'r') as file:
     	# Read the entire content of the file
     	code = file.read()
-
+    print()
+    print(code)
+    print()
     variables, trace, output = qrun(code, return_trace=True, **values)
     print(f"\nfinal variables: {variables}")
     print(f"optical exposures fired: {len(trace)}")
@@ -841,11 +843,7 @@ def interactive_eval():
 if __name__ == "__main__":
     import sys
     print("""
-        Startup arguments:
 
-        "--interactive" in sys.argv or "-i" in sys.argv:
-        "--program" in sys.argv or "-p" in sys.argv:
-	
         Example code:
 	values: target=10
 	----------------------
