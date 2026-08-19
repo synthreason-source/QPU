@@ -1,730 +1,3 @@
-import math
-import random
-import time
-
-import numpy as np
-
-import matplotlib
-
-matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt
-
-
-np.set_printoptions(
-    precision=3,
-    suppress=True,
-)
-
-
-# =====================================================================
-# BINARY 2D PLANE, HOLES, AND CAMERA
-# =====================================================================
-
-def fft2c(
-    field: np.ndarray,
-) -> np.ndarray:
-    """Return a centered 2D Fourier transform."""
-
-    field = np.asarray(
-        field,
-        dtype=complex,
-    )
-
-    return np.fft.fftshift(
-        np.fft.fft2(
-            np.fft.ifftshift(field),
-        ),
-    )
-
-
-def to_square_plane(
-    values: np.ndarray,
-) -> np.ndarray:
-    """Place values on a square binary 2D plane."""
-
-    values = np.asarray(values)
-
-    if values.ndim != 1:
-        raise ValueError(
-            "values must be one-dimensional"
-        )
-
-    if not np.all(
-        np.isfinite(values),
-    ):
-        raise ValueError(
-            "values must be finite"
-        )
-
-    if not np.all(
-        values == values.astype(int),
-    ):
-        raise ValueError(
-            "values must contain integers"
-        )
-
-    if np.any(values < 0):
-        raise ValueError(
-            "values must be nonnegative"
-        )
-
-    count = values.size
-
-    side = int(
-        np.ceil(
-            np.sqrt(
-                max(count, 1),
-            ),
-        ),
-    )
-
-    plane = np.zeros(
-        (side, side),
-        dtype=np.uint8,
-    )
-
-    plane.flat[:count] = values.astype(
-        np.uint8,
-    )
-
-    if not np.all(
-        np.isin(
-            plane,
-            [0, 1],
-        ),
-    ):
-        raise ValueError(
-            "the 2D plane must be binary"
-        )
-
-    return plane
-
-
-def make_binary_plane_and_holes(
-    values: np.ndarray,
-):
-    """Create a binary 2D plane and matching holes."""
-
-    values = np.asarray(values)
-
-    if values.ndim != 1:
-        raise ValueError(
-            "values must be one-dimensional"
-        )
-
-    if not np.all(
-        np.isin(
-            values,
-            [0, 1],
-        ),
-    ):
-        raise ValueError(
-            "values must contain only 0 or 1"
-        )
-
-    plane = to_square_plane(
-        values,
-    )
-
-    holes = np.zeros(
-        plane.shape,
-        dtype=np.uint8,
-    )
-
-    holes.flat[:values.size] = 1
-
-    return plane, holes
-
-
-def apply_holes(
-    plane: np.ndarray,
-    holes: np.ndarray,
-) -> np.ndarray:
-    """Apply binary holes to a binary 2D plane."""
-
-    plane = np.asarray(
-        plane,
-        dtype=np.uint8,
-    )
-
-    holes = np.asarray(
-        holes,
-        dtype=np.uint8,
-    )
-
-    if plane.ndim != 2:
-        raise ValueError(
-            "plane must be a 2D array"
-        )
-
-    if holes.ndim != 2:
-        raise ValueError(
-            "holes must be a 2D array"
-        )
-
-    if plane.shape != holes.shape:
-        raise ValueError(
-            "plane and holes must have the same shape"
-        )
-
-    if not np.all(
-        np.isin(
-            plane,
-            [0, 1],
-        ),
-    ):
-        raise ValueError(
-            "plane must contain only 0 or 1"
-        )
-
-    if not np.all(
-        np.isin(
-            holes,
-            [0, 1],
-        ),
-    ):
-        raise ValueError(
-            "holes must contain only 0 or 1"
-        )
-
-    return (
-        plane * holes
-    ).astype(
-        np.uint8,
-    )
-
-
-def camera_exposure(
-    plane: np.ndarray,
-    holes: np.ndarray,
-):
-    """Apply holes and calculate the camera intensity."""
-
-    transmitted_plane = apply_holes(
-        plane,
-        holes,
-    )
-
-    camera_field = fft2c(
-        transmitted_plane,
-    )
-
-    camera_intensity = np.abs(
-        camera_field,
-    ) ** 2
-
-    center_y = camera_field.shape[0] // 2
-    center_x = camera_field.shape[1] // 2
-
-    dc_index = (
-        center_y,
-        center_x,
-    )
-
-    dc_field = camera_field[dc_index]
-    dc_intensity = float(
-        camera_intensity[dc_index],
-    )
-
-    return {
-        "plane": np.asarray(
-            plane,
-        ),
-        "holes": np.asarray(
-            holes,
-        ),
-        "transmitted_plane": transmitted_plane,
-        "camera_field": camera_field,
-        "camera_intensity": camera_intensity,
-        "dc_index": dc_index,
-        "dc_field": dc_field,
-        "dc_intensity": dc_intensity,
-        "dc_amplitude_magnitude": math.sqrt(
-            dc_intensity,
-        ),
-    }
-
-
-# =====================================================================
-# BINARY OPERATIONS
-# =====================================================================
-
-def binary_multiply(
-    x: int,
-    y: int,
-    return_optics: bool = False,
-):
-    """Multiply two binary values using one plane, holes, and camera."""
-
-    if x not in (0, 1):
-        raise ValueError(
-            "x must be 0 or 1"
-        )
-
-    if y not in (0, 1):
-        raise ValueError(
-            "y must be 0 or 1"
-        )
-
-    plane = np.array(
-        [[x]],
-        dtype=np.uint8,
-    )
-
-    holes = np.array(
-        [[y]],
-        dtype=np.uint8,
-    )
-
-    optics = camera_exposure(
-        plane,
-        holes,
-    )
-
-    result = int(
-        round(
-            optics["dc_field"].real,
-        ),
-    )
-
-    if return_optics:
-        return result, optics
-
-    return result
-
-
-def binary_add_many(
-    values,
-    return_optics: bool = False,
-):
-    """Sum binary values using one binary plane and camera."""
-
-    values = np.asarray(
-        values,
-        dtype=np.uint8,
-    )
-
-    if values.ndim != 1:
-        raise ValueError(
-            "values must be one-dimensional"
-        )
-
-    if not np.all(
-        np.isin(
-            values,
-            [0, 1],
-        ),
-    ):
-        raise ValueError(
-            "values must contain only 0 or 1"
-        )
-
-    plane, holes = make_binary_plane_and_holes(
-        values,
-    )
-
-    optics = camera_exposure(
-        plane,
-        holes,
-    )
-
-    result = int(
-        round(
-            optics["dc_field"].real,
-        ),
-    )
-
-    if return_optics:
-        return result, optics
-
-    return result
-
-
-# =====================================================================
-# 3D BINARY LOOP
-# =====================================================================
-
-def evaluate_3d_binary_loop(
-    A,
-    B,
-    C,
-):
-    """Evaluate a triple loop for binary input arrays."""
-
-    A = np.asarray(
-        A,
-        dtype=np.uint8,
-    )
-
-    B = np.asarray(
-        B,
-        dtype=np.uint8,
-    )
-
-    C = np.asarray(
-        C,
-        dtype=np.uint8,
-    )
-
-    for values in (A, B, C):
-        if values.ndim != 1:
-            raise ValueError(
-                "all inputs must be one-dimensional"
-            )
-
-        if not np.all(
-            np.isin(
-                values,
-                [0, 1],
-            ),
-        ):
-            raise ValueError(
-                "all inputs must contain only 0 or 1"
-            )
-
-    terms = []
-    trace = []
-
-    for i, a in enumerate(A):
-        for j, b in enumerate(B):
-            for k, c in enumerate(C):
-
-                ab = binary_multiply(
-                    int(a),
-                    int(b),
-                )
-
-                term = binary_multiply(
-                    ab,
-                    int(c),
-                )
-
-                terms.append(
-                    term,
-                )
-
-                trace.append(
-                    (
-                        i,
-                        j,
-                        k,
-                        int(a),
-                        int(b),
-                        int(c),
-                        term,
-                    ),
-                )
-
-    result, optics = binary_add_many(
-        terms,
-        return_optics=True,
-    )
-
-    return result, terms, trace, optics
-
-
-# =====================================================================
-# DIGITAL BASELINE
-# =====================================================================
-
-def digital_binary_loop(
-    A,
-    B,
-    C,
-):
-    """Calculate the same binary triple loop digitally."""
-
-    total = 0
-
-    for a in A:
-        for b in B:
-            for c in C:
-                total += int(a) * int(b) * int(c)
-
-    return total
-
-
-# =====================================================================
-# VISUALIZATION
-# =====================================================================
-
-def plot_matrix(
-    fig,
-    ax,
-    data,
-    title,
-    cmap="viridis",
-    vmin=None,
-    vmax=None,
-    annotate=False,
-    mark=None,
-):
-    """Plot a 2D matrix."""
-
-    image = ax.imshow(
-        data,
-        origin="lower",
-        interpolation="nearest",
-        cmap=cmap,
-        vmin=vmin,
-        vmax=vmax,
-        aspect="auto",
-    )
-
-    ax.set_title(
-        title,
-        fontsize=10,
-    )
-
-    if annotate and data.size <= 64:
-        for row in range(data.shape[0]):
-            for column in range(data.shape[1]):
-
-                value = data[row, column]
-
-                if np.iscomplexobj(data):
-                    label = f"{value.real:.0f}"
-                else:
-                    label = f"{value:.0f}"
-
-                ax.text(
-                    column,
-                    row,
-                    label,
-                    ha="center",
-                    va="center",
-                    color="white",
-                    fontsize=7,
-                )
-
-    if mark is not None:
-        mark_y, mark_x = mark
-
-        ax.plot(
-            mark_x,
-            mark_y,
-            marker="x",
-            color="lime",
-            markersize=12,
-            markeredgewidth=2,
-        )
-
-    fig.colorbar(
-        image,
-        ax=ax,
-        shrink=0.75,
-    )
-
-
-def make_binary_visualization(
-    plane,
-    holes,
-    optics,
-    result,
-    out_path,
-):
-    """Visualize the binary plane, holes, and camera."""
-
-    fig, axes = plt.subplots(
-        2,
-        3,
-        figsize=(15, 9),
-        layout="constrained",
-    )
-
-    plot_matrix(
-        fig,
-        axes[0, 0],
-        plane,
-        "Binary 2D plane",
-        cmap="gray",
-        vmin=0,
-        vmax=1,
-        annotate=plane.size <= 64,
-    )
-
-    plot_matrix(
-        fig,
-        axes[0, 1],
-        holes,
-        "Binary holes",
-        cmap="gray",
-        vmin=0,
-        vmax=1,
-        annotate=holes.size <= 64,
-    )
-
-    plot_matrix(
-        fig,
-        axes[0, 2],
-        optics["transmitted_plane"],
-        "Transmitted binary plane",
-        cmap="gray",
-        vmin=0,
-        vmax=1,
-        annotate=optics["transmitted_plane"].size <= 64,
-    )
-
-    plot_matrix(
-        fig,
-        axes[1, 0],
-        np.abs(
-            optics["camera_field"],
-        ),
-        "Camera field magnitude",
-        cmap="magma",
-    )
-
-    plot_matrix(
-        fig,
-        axes[1, 1],
-        optics["camera_intensity"],
-        "Camera intensity",
-        cmap="inferno",
-        mark=optics["dc_index"],
-    )
-
-    axes[1, 2].axis("off")
-
-    lines = [
-        "BINARY PLANE + HOLES + CAMERA",
-        "",
-        f"result: {result}",
-        "",
-        f"DC index: {optics['dc_index']}",
-        f"DC field: {optics['dc_field']}",
-        f"DC intensity: {optics['dc_intensity']:.3f}",
-    ]
-
-    axes[1, 2].text(
-        0.0,
-        1.0,
-        "\n".join(lines),
-        va="top",
-        family="monospace",
-        fontsize=10,
-        transform=axes[1, 2].transAxes,
-    )
-
-    fig.suptitle(
-        "Binary 2D Plane, Holes, and Camera",
-        fontsize=15,
-    )
-
-    fig.savefig(
-        out_path,
-        dpi=150,
-        bbox_inches="tight",
-    )
-
-    plt.close(fig)
-
-
-# =====================================================================
-# DEMO
-# =====================================================================
-
-def run_demo(
-    A=None,
-    B=None,
-    C=None,
-    out_path="binary_plane_holes_camera.png",
-    seed=7,
-):
-    """Run the binary-plane demonstration."""
-
-    rng = random.Random(
-        seed,
-    )
-
-    if A is None:
-        A = [
-            rng.randint(0, 1)
-            for _ in range(4)
-        ]
-
-    if B is None:
-        B = [
-            rng.randint(0, 1)
-            for _ in range(4)
-        ]
-
-    if C is None:
-        C = [
-            rng.randint(0, 1)
-            for _ in range(4)
-        ]
-
-    start = time.perf_counter()
-
-    digital_result = digital_binary_loop(
-        A,
-        B,
-        C,
-    )
-
-    digital_time = time.perf_counter() - start
-
-    start = time.perf_counter()
-
-    optical_result, terms, trace, optics = (
-        evaluate_3d_binary_loop(
-            A,
-            B,
-            C,
-        )
-    )
-
-    optical_time = time.perf_counter() - start
-
-    plane, holes = make_binary_plane_and_holes(
-        np.array(
-            terms,
-            dtype=np.uint8,
-        ),
-    )
-
-    print("=" * 78)
-    print("BINARY 2D PLANE, HOLES, AND CAMERA")
-    print("=" * 78)
-    print(f"A: {A}")
-    print(f"B: {B}")
-    print(f"C: {C}")
-    print(f"loop shape: {len(A)} × {len(B)} × {len(C)}")
-    print(f"number of terms: {len(terms)}")
-    print()
-    print(f"digital result: {digital_result}")
-    print(f"camera result: {optical_result}")
-    print(f"match: {digital_result == optical_result}")
-    print()
-    print(f"2D plane shape: {plane.shape}")
-    print(f"camera DC index: {optics['dc_index']}")
-    print(f"camera DC intensity: {optics['dc_intensity']:.3f}")
-    print()
-    print(f"digital time: {digital_time * 1000:.3f} ms")
-    print(f"camera simulation time: {optical_time * 1000:.3f} ms")
-
-    if digital_result != optical_result:
-        raise AssertionError(
-            "camera result disagreed with digital result"
-        )
-
-    make_binary_visualization(
-        plane,
-        holes,
-        optics,
-        optical_result,
-        out_path,
-    )
-
-    print(f"PNG: {out_path}")
-
-    return optical_result, optics
-
-
-
-
 """
 optical_eval.py
 ================
@@ -736,26 +9,48 @@ The original module only exposes two primitives:
     binary_multiply(x, y)   -> one hole pair + camera read (AND)
     binary_add_many(values) -> one plane of holes + camera read (SUM)
 
-Everything else (loops, De Morgan expansions, etc.) had to be hand-written
-against those two calls. This module gives you two ways to *program*
-against the optical backend instead of hand-wiring it:
+Everything else (loops, De Morgan expansions, arithmetic, etc.) had to be
+hand-written against those two calls. This module gives you two ways to
+*program* against the optical backend instead of hand-wiring it:
 
-1. Bit  - a tiny wrapper around 0/1 that overloads &, |, ^, ~ so you can
-          just write ordinary Python boolean expressions and have every
-          operation actually execute through camera_exposure().
+1. Bit  - a wrapper around a nonnegative integer that overloads
+          & | ^ ~  (boolean, bits only) and + - *  (arithmetic, any
+          nonnegative integer) so you can write ordinary Python
+          expressions and have every operation actually execute through
+          camera_exposure().
 
 2. qeval(expr, **vars) - a real "eval()" that takes a *string* of
-          Python-flavoured boolean/bitwise syntax and runs it through the
-          same optical primitives, returning the result (and, optionally,
-          a step-by-step trace of every optical exposure that fired).
+          Python-flavoured boolean/bitwise/arithmetic syntax and runs it
+          through the same optical primitives, returning the result
+          (and, optionally, a step-by-step trace of every optical
+          exposure that fired).
 
-Both are built only from binary_multiply / binary_add_many, so nothing
-here bypasses the "optics" - it's just a friendlier way to drive it.
+Both layers are built only from binary_multiply / binary_add_many /
+apply_holes, so nothing here bypasses the "optics" - it's just a
+friendlier way to drive it. Arithmetic (+, -, *) reuses the exact same
+camera: an integer is represented as that many open holes (unary), so
+"addition" is literally combining two hole-counts on one aperture and
+reading the total intensity, and "multiplication" is repeated addition.
+
+    +   optical_add(a, b)       open a+b holes, read the total count
+    -   optical_subtract(a, b)  start with a holes open, close b of them,
+                                 read what's left (uses apply_holes)
+    *   optical_multiply(a, b)  b passes of optical_add, i.e. repeated
+                                 optical addition (or a single AND
+                                 exposure in the 0/1 x 0/1 case)
 """
 
 import ast
 
-from optical_binary import binary_multiply, binary_add_many
+import numpy as np
+
+from optical_binary import (
+    binary_multiply,
+    binary_add_many,
+    make_binary_plane_and_holes,
+    apply_holes,
+    camera_exposure,
+)
 
 
 # =====================================================================
@@ -793,16 +88,93 @@ def opt_not(x: int) -> int:
 
 
 # =====================================================================
+# THE OPTICAL ARITHMETIC
+# =====================================================================
+#
+# The same aperture that sums bits for OR/XOR can sum *counts* of bits.
+# Represent a nonnegative integer n as n open holes (a unary code). Then:
+#   - addition   = put both operands' holes on one aperture, read the total
+#   - subtraction = start with a's holes open, close b of them, read what's left
+#   - multiplication = repeated addition (or a single AND exposure for bits)
+
+def _require_nonneg_int(name, value):
+    if not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} expects a nonnegative integer, got {value!r}")
+    return value
+
+
+def optical_add(a: int, b: int) -> int:
+    """a + b: open a+b holes on one aperture, read the total transmitted count."""
+    _require_nonneg_int("optical_add", a)
+    _require_nonneg_int("optical_add", b)
+    values = [1] * a + [1] * b
+    if not values:
+        return 0
+    return binary_add_many(values)
+
+
+def optical_subtract(a: int, b: int) -> int:
+    """a - b: start with a holes open, close b of them, read what's left."""
+    _require_nonneg_int("optical_subtract", a)
+    _require_nonneg_int("optical_subtract", b)
+    if b > a:
+        raise ValueError(
+            "optical_subtract: an aperture can't hold a negative photon "
+            f"count ({a} - {b} < 0)"
+        )
+    if a == 0:
+        return 0
+
+    plane, holes = make_binary_plane_and_holes(
+        np.ones(a, dtype=np.uint8),
+    )
+
+    # Close b of the currently-open holes.
+    flat_holes = holes.flatten()
+    closed = 0
+    for i in range(flat_holes.size):
+        if flat_holes[i] == 1 and closed < b:
+            flat_holes[i] = 0
+            closed += 1
+    holes = flat_holes.reshape(holes.shape)
+
+    optics = camera_exposure(plane, holes)
+    return int(round(optics["dc_field"].real))
+
+
+def optical_multiply(a: int, b: int) -> int:
+    """a * b: repeated optical addition (b passes), or one AND exposure for bits."""
+    _require_nonneg_int("optical_multiply", a)
+    _require_nonneg_int("optical_multiply", b)
+
+    if a in (0, 1) and b in (0, 1):
+        # Single-bit case: this *is* the hardware's native AND exposure.
+        return binary_multiply(a, b)
+
+    total = 0
+    for _ in range(b):
+        total = optical_add(total, a)
+    return total
+
+
+# =====================================================================
 # 1) Bit - operator-overloaded value, so plain Python syntax "is" the program
 # =====================================================================
 
 class Bit:
     """
-    A 0/1 value whose operators are wired straight into the optical
-    primitives. Write normal Python:
+    A nonnegative-integer value whose operators are wired straight into
+    the optical primitives. Write normal Python:
 
         a, b, c = Bit(1), Bit(0), Bit(1)
-        result = (a & b) | c        # every &, |, ^, ~ below fires the camera
+        logic  = (a & b) | c         # & | ^ ~   -> boolean, bits only
+        total  = a + b + c           # + - *     -> arithmetic, any nonneg int
+        scaled = total * Bit(3)
+
+    Boolean operators (& | ^ ~) still require 0/1 operands, since that's
+    what the AND/OR/XOR exposures are defined over. Arithmetic operators
+    (+ - *) accept any nonnegative integer, since they're built on the
+    same aperture used in unary (open-hole-count) form.
 
     `result.trace` accumulates a log of every optical exposure that ran,
     in order, so you can see exactly which hole-pairs/planes were used.
@@ -810,8 +182,8 @@ class Bit:
 
     def __init__(self, value, trace=None):
         value = int(value)
-        if value not in (0, 1):
-            raise ValueError("Bit must be 0 or 1")
+        if value < 0:
+            raise ValueError("Bit must be a nonnegative integer")
         self.value = value
         self.trace = trace if trace is not None else []
 
@@ -821,16 +193,14 @@ class Bit:
             merged.extend(other.trace)
         return merged
 
-    def _log(self, op, inputs, result):
-        self.trace_entry = (op, inputs, result)
-        return self.trace_entry
-
     def _combine(self, other, op_name, op_fn):
         other_val = other.value if isinstance(other, Bit) else int(other)
         result = op_fn(self.value, other_val)
         trace = self._merge_trace(other)
         trace.append((op_name, (self.value, other_val), result))
         return Bit(result, trace=trace)
+
+    # --- boolean (bits only) ---
 
     def __and__(self, other):
         return self._combine(other, "AND", opt_and)
@@ -846,6 +216,28 @@ class Bit:
         trace = list(self.trace)
         trace.append(("NOT", (self.value,), result))
         return Bit(result, trace=trace)
+
+    # --- arithmetic (any nonnegative integer) ---
+
+    def __add__(self, other):
+        return self._combine(other, "ADD", optical_add)
+
+    def __radd__(self, other):
+        return self._combine(other, "ADD", lambda x, y: optical_add(y, x))
+
+    def __sub__(self, other):
+        return self._combine(other, "SUB", optical_subtract)
+
+    def __rsub__(self, other):
+        return self._combine(other, "SUB", lambda x, y: optical_subtract(y, x))
+
+    def __mul__(self, other):
+        return self._combine(other, "MUL", optical_multiply)
+
+    def __rmul__(self, other):
+        return self._combine(other, "MUL", lambda x, y: optical_multiply(y, x))
+
+    # --- plumbing ---
 
     def __int__(self):
         return self.value
@@ -874,6 +266,9 @@ _BINOP_TABLE = {
     ast.BitAnd: opt_and,
     ast.BitOr: opt_or,
     ast.BitXor: opt_xor,
+    ast.Add: optical_add,
+    ast.Sub: optical_subtract,
+    ast.Mult: optical_multiply,
 }
 
 _BOOLOP_TABLE = {
@@ -900,20 +295,20 @@ class _OpticalExpressionEvaluator(ast.NodeVisitor):
         if node.id not in self.variables:
             raise NameError(f"unknown variable '{node.id}' in expression")
         value = int(self.variables[node.id])
-        if value not in (0, 1):
-            raise ValueError(f"variable '{node.id}' must be 0 or 1")
+        if value < 0:
+            raise ValueError(f"variable '{node.id}' must be a nonnegative integer")
         return value
 
     def visit_Constant(self, node):
-        if node.value not in (0, 1):
-            raise ValueError("literals must be 0 or 1")
+        if not isinstance(node.value, int) or node.value < 0:
+            raise ValueError("literals must be nonnegative integers")
         return int(node.value)
 
     def visit_BinOp(self, node):
         op_type = type(node.op)
         if op_type not in _BINOP_TABLE:
             raise SyntaxError(
-                f"unsupported operator {op_type.__name__}; use & | ^ ~"
+                f"unsupported operator {op_type.__name__}; use & | ^ ~ + - *"
             )
         left = self.visit(node.left)
         right = self.visit(node.right)
@@ -950,9 +345,14 @@ def qeval(expr: str, return_trace: bool = False, **variables):
     Example:
         qeval("(a & b) | ~c", a=1, b=0, c=1)   -> 0
         qeval("a and b or c", a=1, b=1, c=0, return_trace=True)
+        qeval("a + b * c", a=2, b=3, c=4)      -> 14
+        qeval("(a + b) - c", a=5, b=2, c=3)    -> 4
 
-    Supported syntax: & | ^ ~  and the keywords and/or/not, plus
-    parentheses and 0/1 variables - i.e. ordinary Python boolean syntax.
+    Supported syntax: & | ^ ~  (boolean, 0/1 operands only) and
+    + - *  (arithmetic, any nonnegative integer), plus the keywords
+    and/or/not, parentheses, and variables/literals - ordinary Python
+    boolean + arithmetic syntax, minus negative numbers (apertures can't
+    hold a negative photon count).
     """
 
     tree = ast.parse(expr, mode="eval")
@@ -985,22 +385,28 @@ def demo_bit_style(A, B, C):
     return total
 
 def interactive_eval():
-    print("""
-    Prompt for an expression and its 0/1 variable values, then run it
-    through ooeval(). Values are entered as "a=1,b=0,c=1".
- 
+    """
+    Prompt for an expression and its variable values, then run it
+    through qeval(). Values are entered as "a=1,b=0,c=1" and can be any
+    nonnegative integer for arithmetic (+ - *); boolean operators
+    (& | ^ ~) still require 0/1.
+
     Example session:
         Enter expression: (a & b) | ~c
         Enter values: a=1,b=0,c=1
-        ooeval('(a & b) | ~c', {'a': 1, 'b': 0, 'c': 1}) = 0
+        qeval('(a & b) | ~c', {'a': 1, 'b': 0, 'c': 1}) = 0
             [1] BitAnd(1, 0) -> 0
             [2] NOT(1,) -> 0
             [3] BitOr(0, 0) -> 0
-    """)
- 
+
+        Enter expression: a + b * c
+        Enter values: a=2,b=3,c=4
+        qeval('a + b * c', {'a': 2, 'b': 3, 'c': 4}) = 14
+    """
+
     expr = input("Enter expression: ").strip()
-    values_str = input("Enter values (e.g. a=1,b=0,c=1): ").strip()
- 
+    values_str = input("Enter values (e.g. a=2,b=3,c=4): ").strip()
+
     values = {}
     for pair in values_str.split(","):
         pair = pair.strip()
@@ -1008,26 +414,38 @@ def interactive_eval():
             continue
         if "=" not in pair:
             raise ValueError(
-                f"expected 'name=0/1', got '{pair}'"
+                f"expected 'name=value', got '{pair}'"
             )
         name, val = pair.split("=", 1)
         name = name.strip()
         val = int(val.strip())
-        if val not in (0, 1):
-            raise ValueError(f"'{name}' must be 0 or 1, got {val}")
+        if val < 0:
+            raise ValueError(f"'{name}' must be a nonnegative integer, got {val}")
         values[name] = val
- 
+
     result, trace = qeval(expr, return_trace=True, **values)
- 
-    print(f"\nooeval({expr!r}, {values}) = {result}")
+
+    print(f"\nqeval({expr!r}, {values}) = {result}")
     for step, (op, inputs, out) in enumerate(trace, start=1):
         print(f"    [{step}] {op}{inputs} -> {out}")
- 
-    return result
-if __name__ == "__main__":
 
-    print()
-    print("=" * 78)
-    print("qeval - text expressions evaluated through the optical backend")
-    print("=" * 78)
+    return result
+
+
+if __name__ == "__main__":
+    import sys
+    
+    print("""examples = [
+        ("a & b", dict(a=1, b=1)),
+        ("a & b & c", dict(a=1, b=1, c=0)),
+        ("a | b", dict(a=0, b=1)),
+        ("a ^ b", dict(a=1, b=1)),
+        ("~a & b", dict(a=0, b=1)),
+        ("(a & b) | (~c & d)", dict(a=1, b=0, c=1, d=1)),
+        ("a and b or c", dict(a=0, b=1, c=0)),
+        ("a + b", dict(a=2, b=3)),
+        ("a + b * c", dict(a=2, b=3, c=4)),
+        ("(a + b) - c", dict(a=5, b=2, c=3)),
+        ("a * b * c", dict(a=2, b=3, c=4)),
+    ]""")
     interactive_eval()
