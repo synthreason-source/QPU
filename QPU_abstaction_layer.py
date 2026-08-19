@@ -20,10 +20,10 @@ hand-wiring it:
             Python expressions and have every operation actually
             execute through camera_exposure().
 
-2. qeval(expr, **vars) - a real "eval()" for a *single expression*
+2. ooeval(expr, **vars) - a real "eval()" for a *single expression*
             string, same operator set as Bit.
 
-3. qrun(code, **vars)  - a real "exec()" for a small *program*: plain
+3. oorun(code, **vars)  - a real "exec()" for a small *program*: plain
             assignment, if/elif/else, while, for name in range(...)/
             [list], break/continue, and print(...). Every expression
             evaluated while the program runs (loop bounds, conditions,
@@ -342,7 +342,7 @@ class Bit:
 
 
 # =====================================================================
-# 2) qeval - a real eval() for text expressions
+# 2) ooeval - a real eval() for text expressions
 # =====================================================================
 
 # Which Python AST operators map to which optical primitive.
@@ -375,7 +375,7 @@ class _OpticalExpressionEvaluator(ast.NodeVisitor):
 
     def __init__(self, variables, trace=None):
         self.variables = variables
-        # `trace` can be a list shared with a caller (e.g. qrun, running a
+        # `trace` can be a list shared with a caller (e.g. oorun, running a
         # whole program) so every exposure across many expressions lands
         # in one continuous log; if omitted, this evaluator keeps its own.
         self.trace = trace if trace is not None else []
@@ -453,17 +453,17 @@ class _OpticalExpressionEvaluator(ast.NodeVisitor):
         raise SyntaxError(f"unsupported syntax: {type(node).__name__}")
 
 
-def qeval(expr: str, return_trace: bool = False, **variables):
+def ooeval(expr: str, return_trace: bool = False, **variables):
     """
     Evaluate a boolean/bitwise expression string through the optical backend.
 
     Example:
-        qeval("(a & b) | ~c", a=1, b=0, c=1)   -> 0
-        qeval("a and b or c", a=1, b=1, c=0, return_trace=True)
-        qeval("a + b * c", a=2, b=3, c=4)      -> 14
-        qeval("(a + b) - c", a=5, b=2, c=3)    -> 4
-        qeval("a == b", a=3, b=3)              -> 1
-        qeval("a < b < c", a=1, b=2, c=3)      -> 1
+        ooeval("(a & b) | ~c", a=1, b=0, c=1)   -> 0
+        ooeval("a and b or c", a=1, b=1, c=0, return_trace=True)
+        ooeval("a + b * c", a=2, b=3, c=4)      -> 14
+        ooeval("(a + b) - c", a=5, b=2, c=3)    -> 4
+        ooeval("a == b", a=3, b=3)              -> 1
+        ooeval("a < b < c", a=1, b=2, c=3)      -> 1
 
     Supported syntax: & | ^ ~  (boolean, 0/1 operands only),
     + - *  (arithmetic, any nonnegative integer), and
@@ -483,7 +483,7 @@ def qeval(expr: str, return_trace: bool = False, **variables):
 
 
 # =====================================================================
-# 3) qrun - a small programming language: assignment, if/elif/else,
+# 3) oorun - a small programming language: assignment, if/elif/else,
 #    while, for, break/continue, print - all sitting on the same optics
 # =====================================================================
 
@@ -622,7 +622,7 @@ class _OpticalStatementExecutor(ast.NodeVisitor):
         raise SyntaxError(f"unsupported statement: {type(node).__name__}")
 
 
-def qrun(code: str, return_trace: bool = False, **initial_variables):
+def oorun(code: str, return_trace: bool = False, **initial_variables):
     """
     Run a small program through the optical backend: assignment,
     if/elif/else, while, for, break/continue, and print(). Every
@@ -630,14 +630,14 @@ def qrun(code: str, return_trace: bool = False, **initial_variables):
     real exposure through camera_exposure(), logged in order.
 
     Example:
-        qrun('''
+        oorun('''
         total = 0
         for i in range(5):
             total = total + i
         print(total)
         ''')  # prints 10, returns {'total': 10, 'i': 4}
 
-        qrun('''
+        oorun('''
         if a > b:
             bigger = a
         else:
@@ -646,7 +646,7 @@ def qrun(code: str, return_trace: bool = False, **initial_variables):
 
     Supported syntax: = += (with & | ^ ^ + - * as the op), if/elif/else,
     while, for name in range(...) / [literal list], break, continue,
-    print(...), and any expression qeval() accepts. Nonnegative
+    print(...), and any expression ooeval() accepts. Nonnegative
     integers only - no negative numbers, no floats, no lists as values.
 
     Returns the final variables dict; pass return_trace=True to also get
@@ -687,8 +687,8 @@ def demo_bit_style(A, B, C):
     return total
 
 
-def demo_qeval_style():
-    """A handful of expressions run straight through qeval()."""
+def demo_ooeval_style():
+    """A handful of expressions run straight through ooeval()."""
     examples = [
         ("a & b", dict(a=1, b=1)),
         ("a & b & c", dict(a=1, b=1, c=0)),
@@ -706,14 +706,14 @@ def demo_qeval_style():
     ]
 
     for expr, values in examples:
-        result, trace = qeval(expr, return_trace=True, **values)
-        print(f"qeval({expr!r}, {values}) = {result}")
+        result, trace = ooeval(expr, return_trace=True, **values)
+        print(f"ooeval({expr!r}, {values}) = {result}")
         for step, (op, inputs, out) in enumerate(trace, start=1):
             print(f"    [{step}] {op}{inputs} -> {out}")
 
 
-def demo_qrun_style():
-    """A couple of small programs run through qrun()."""
+def demo_oorun_style():
+    """A couple of small programs run through oorun()."""
 
     print("-- sum 0..4 with a for-loop --")
     program = """
@@ -722,7 +722,7 @@ for i in range(5):
     total = total + i
 print(total)
 """
-    variables, trace, _ = qrun(program, return_trace=True)
+    variables, trace, _ = oorun(program, return_trace=True)
     print(f"final variables: {variables}")
     print(f"optical exposures fired: {len(trace)}")
 
@@ -739,7 +739,7 @@ while n <= limit:
         print(n, 2)
     n = n + 1
 """
-    variables, trace, output = qrun(
+    variables, trace, output = oorun(
         program, return_trace=True, limit=5, target=3,
     )
     print(f"final variables: {variables}")
@@ -755,7 +755,7 @@ for n in range(1, limit):
         break
 print(found)
 """
-    variables, trace, output = qrun(
+    variables, trace, output = oorun(
         program, return_trace=True, limit=20, target=49,
     )
     print(f"final variables: {variables}")
@@ -764,7 +764,7 @@ print(found)
 
 def interactive_program():
     """
-    Read a multi-line qrun() program from stdin (blank line ends input),
+    Read a multi-line oorun() program from stdin (blank line ends input),
     then run it. Optionally seed starting variables with 'name=value'
     pairs first.
     """
@@ -778,14 +778,16 @@ def interactive_program():
         name, val = pair.split("=", 1)
         values[name.strip()] = int(val.strip())
 
-   
-    with open(input("Filename: "), 'r') as file:
-    	# Read the entire content of the file
-    	code = file.read()
-    print()
-    print(code)
-    print()
-    variables, trace, output = qrun(code, return_trace=True, **values)
+    print("Enter your program, blank line to run it:")
+    lines = []
+    while True:
+        line = input()
+        if line == "":
+            break
+        lines.append(line)
+    code = "\n".join(lines)
+
+    variables, trace, output = oorun(code, return_trace=True, **values)
     print(f"\nfinal variables: {variables}")
     print(f"optical exposures fired: {len(trace)}")
     return variables
@@ -794,21 +796,21 @@ def interactive_program():
 def interactive_eval():
     """
     Prompt for an expression and its variable values, then run it
-    through qeval(). Values are entered as "a=1,b=0,c=1" and can be any
+    through ooeval(). Values are entered as "a=1,b=0,c=1" and can be any
     nonnegative integer for arithmetic (+ - *); boolean operators
     (& | ^ ~) still require 0/1.
 
     Example session:
         Enter expression: (a & b) | ~c
         Enter values: a=1,b=0,c=1
-        qeval('(a & b) | ~c', {'a': 1, 'b': 0, 'c': 1}) = 0
+        ooeval('(a & b) | ~c', {'a': 1, 'b': 0, 'c': 1}) = 0
             [1] BitAnd(1, 0) -> 0
             [2] NOT(1,) -> 0
             [3] BitOr(0, 0) -> 0
 
         Enter expression: a + b * c
         Enter values: a=2,b=3,c=4
-        qeval('a + b * c', {'a': 2, 'b': 3, 'c': 4}) = 14
+        ooeval('a + b * c', {'a': 2, 'b': 3, 'c': 4}) = 14
     """
 
     expr = input("Enter expression: ").strip()
@@ -830,32 +832,53 @@ def interactive_eval():
             raise ValueError(f"'{name}' must be a nonnegative integer, got {val}")
         values[name] = val
 
-    result, trace = qeval(expr, return_trace=True, **values)
+    result, trace = ooeval(expr, return_trace=True, **values)
 
-    print(f"\nqeval({expr!r}, {values}) = {result}")
+    print(f"\nooeval({expr!r}, {values}) = {result}")
     for step, (op, inputs, out) in enumerate(trace, start=1):
         print(f"    [{step}] {op}{inputs} -> {out}")
 
     return result
 
 
+def run_program_file(path: str, **initial_variables):
+    """
+    Load and run an oorun() program from a file, e.g.:
+        python3 optical_eval.py --file code.q target=16 limit=20
+    """
+    with open(path, "r") as f:
+        code = f.read()
+
+    variables, trace, output = oorun(code, return_trace=True, **initial_variables)
+
+    print(f"\nfinal variables: {variables}")
+    print(f"optical exposures fired: {len(trace)}")
+    return variables
+
+
 if __name__ == "__main__":
     import sys
-    print("""
 
-        Example code:
-	values: target=10
-	----------------------
-	found = 0
-	for n in range(1, 20):
-    	if n * n == target:
-        	found = n
-        	break
-	print(found)
-	----------------------
-	""")
+    if "--interactive" in sys.argv or "-i" in sys.argv:
+        interactive_eval()
+        raise SystemExit(0)
 
+    if "--program" in sys.argv or "-p" in sys.argv:
+        interactive_program()
+        raise SystemExit(0)
 
-    interactive_program()
+    if "--file" in sys.argv or "-f" in sys.argv:
+        flag = "--file" if "--file" in sys.argv else "-f"
+        idx = sys.argv.index(flag)
+        file_path = sys.argv[idx + 1]
 
-   
+        file_values = {}
+        for kv in sys.argv[idx + 2:]:
+            if "=" in kv:
+                name, val = kv.split("=", 1)
+                file_values[name.strip()] = int(val.strip())
+
+        run_program_file(file_path, **file_values)
+        raise SystemExit(0)
+
+    
