@@ -1,5 +1,5 @@
 for n in range(1, 20):
-    if n * n == target:
-        found = n
-        break
-print(found)
+    for m in range(1, 20):
+        if n * m == target:
+            found = n
+            print(n,m,target)
