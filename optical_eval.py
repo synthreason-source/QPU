@@ -780,12 +780,9 @@ def interactive_program():
 
     print("Enter your program, blank line to run it:")
     lines = []
-    while True:
-        line = input()
-        if line == "":
-            break
-        lines.append(line)
-    code = "\n".join(lines)
+    with open(input("Filename: "), 'r') as file:
+    	# Read the entire content of the file
+    	code = file.read()
 
     variables, trace, output = qrun(code, return_trace=True, **values)
     print(f"\nfinal variables: {variables}")
@@ -850,7 +847,7 @@ if __name__ == "__main__":
         "--program" in sys.argv or "-p" in sys.argv:
 	
         Example code:
-
+	values: target=10
 	----------------------
 	found = 0
 	for n in range(1, 20):
