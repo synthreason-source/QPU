@@ -129,8 +129,8 @@ const uint8_t DEFAULT_VALVE_A_LEVEL = 255;
 const uint8_t DEFAULT_VALVE_B_LEVEL = 255;
 const uint8_t DEFAULT_SAMPLE_COUNT = 8;
 
-const uint16_t MUX_SETTLE_TIME_US = 150;
-const uint16_t VALVE_SETTLE_TIME_US = 300;
+const uint16_t MUX_SETTLE_TIME_US = 1;
+const uint16_t VALVE_SETTLE_TIME_US = 3;
 
 const uint32_t MAX_OPTICAL_EVENTS = 1000000UL;
 
