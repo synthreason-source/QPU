@@ -133,33 +133,20 @@ def int_to_bits(
     width: Optional[int] = None,
 ) -> list[int]:
 
-    value = _nonnegative_int(
-        "value",
-        value,
-    )
+    value = int(value)
 
     if width is None:
-        width = max(
-            1,
-            value.bit_length(),
-        )
+        width = 32
 
     if width < 1:
-        raise ValueError(
-            "width must be positive"
-        )
+        raise ValueError("width must be positive")
 
-    if value >= (1 << width):
-        raise ValueError(
-            f"{value} does not fit "
-            f"in {width} bits"
-        )
+    value &= (1 << width) - 1
 
     return [
         (value >> i) & 1
         for i in range(width)
     ]
-
 
 def bits_to_int(
     bits: Iterable[int],
@@ -555,43 +542,25 @@ class ReducedValveMachine:
         width: Optional[int] = None,
     ) -> int:
 
-        width = (
-            width
-            or self.width
-        )
+        width = width or self.width
 
-        a = _u32(a)
-        b = _u32(b)
+        mask = (1 << width) - 1
 
-        abits = int_to_bits(
-            a,
-            width,
-        )
+        a = int(a) & mask
+        b = int(b) & mask
 
-        bbits = int_to_bits(
-            b,
-            width,
-        )
+        result = 0
 
-        output = []
+        for slot in range(width):
 
-        for slot, (
-            ai,
-            bi,
-        ) in enumerate(
-            zip(
-                abits,
-                bbits,
-            )
-        ):
+            ai = (a >> slot) & 1
+            bi = (b >> slot) & 1
 
             if operation == "AND":
 
-                value = (
-                    self.backend.and_bit(
-                        ai,
-                        bi,
-                    )
+                value = self.backend.and_bit(
+                    ai,
+                    bi,
                 )
 
             elif operation == "OR":
@@ -607,20 +576,18 @@ class ReducedValveMachine:
                 value = (
                     self.backend.sum_bits(
                         [ai, bi]
-                    )
-                    & 1
+                    ) & 1
                 )
 
             else:
 
                 raise ValueError(
-                    f"unknown operation "
-                    f"{operation}"
+                    f"unknown operation {operation}"
                 )
 
-            output.append(
-                value
-            )
+            result |= (
+                int(value) & 1
+            ) << slot
 
             self._record(
                 f"{operation}[t={slot}]",
@@ -628,9 +595,7 @@ class ReducedValveMachine:
                 value,
             )
 
-        return bits_to_int(
-            output
-        )
+        return result & mask
 
     # --------------------------------------------------------
     # 32 BIT LOGIC
@@ -799,6 +764,56 @@ class ReducedValveMachine:
 
         return result & MASK32
 
+    def _add_raw(
+        self,
+        a: int,
+        b: int,
+        ) -> int:
+
+        a &= MASK32
+        b &= MASK32
+
+        result = 0
+        carry = 0
+
+        for slot in range(32):
+
+            ai = (a >> slot) & 1
+            bi = (b >> slot) & 1
+
+            total = self.backend.sum_bits(
+                [
+                    ai,
+                    bi,
+                    carry,
+                ]
+            )
+
+            output_bit = total & 1
+
+            next_carry = int(
+                total >= 2
+            )
+
+            result |= (
+                output_bit << slot
+            )
+
+            self._record(
+                f"ADD32[t={slot}]",
+                (
+                    ai,
+                    bi,
+                    carry,
+                ),
+                output_bit,
+            )
+
+            carry = next_carry
+
+        return result & MASK32
+
+
     def add32(
         self,
         *values: int,
@@ -810,7 +825,7 @@ class ReducedValveMachine:
 
             result = self._add_raw(
                 result,
-                _u32(value),
+                int(value) & MASK32,
             )
 
         result &= MASK32
@@ -2616,7 +2631,125 @@ def extract_sha256(
 # ============================================================
 # SELF TEST
 # ============================================================
+def primitive_self_test():
 
+    machine = ReducedValveMachine()
+
+    tests = [
+        (0x00000000, 0x00000000),
+        (0xFFFFFFFF, 0x00000000),
+        (0xFFFFFFFF, 0xFFFFFFFF),
+        (0x12345678, 0x87654321),
+        (0xAAAAAAAA, 0x55555555),
+        (0x80000000, 0x00000001),
+    ]
+
+    for a, b in tests:
+
+        got = machine.and32(a, b)
+        expected = (
+            a & b
+        ) & MASK32
+
+        assert got == expected, (
+            f"AND32 failed: "
+            f"{a:08x} & {b:08x} = "
+            f"{got:08x}, expected "
+            f"{expected:08x}"
+        )
+
+        got = machine.or32(a, b)
+        expected = (
+            a | b
+        ) & MASK32
+
+        assert got == expected, (
+            f"OR32 failed: "
+            f"{a:08x} | {b:08x} = "
+            f"{got:08x}, expected "
+            f"{expected:08x}"
+        )
+
+        got = machine.xor32(a, b)
+        expected = (
+            a ^ b
+        ) & MASK32
+
+        assert got == expected, (
+            f"XOR32 failed: "
+            f"{a:08x} ^ {b:08x} = "
+            f"{got:08x}, expected "
+            f"{expected:08x}"
+        )
+
+        got = machine.add32(a, b)
+        expected = (
+            a + b
+        ) & MASK32
+
+        assert got == expected, (
+            f"ADD32 failed: "
+            f"{a:08x} + {b:08x} = "
+            f"{got:08x}, expected "
+            f"{expected:08x}"
+        )
+
+        got = machine.not32(a)
+        expected = (
+            ~a
+        ) & MASK32
+
+        assert got == expected, (
+            f"NOT32 failed: "
+            f"~{a:08x} = "
+            f"{got:08x}, expected "
+            f"{expected:08x}"
+        )
+
+    rotations = [
+        (0x12345678, 0),
+        (0x12345678, 1),
+        (0x12345678, 2),
+        (0x12345678, 7),
+        (0x12345678, 13),
+        (0x12345678, 16),
+        (0x12345678, 31),
+        (0xFFFFFFFF, 17),
+    ]
+
+    for value, amount in rotations:
+
+        got = machine.rotr(
+            value,
+            amount,
+        )
+
+        amount %= 32
+
+        expected = (
+            value
+            if amount == 0
+            else (
+                (value >> amount)
+                |
+                (
+                    value
+                    << (32 - amount)
+                )
+            )
+        ) & MASK32
+
+        assert got == expected, (
+            f"ROTR failed: "
+            f"ROTR({value:08x}, {amount}) = "
+            f"{got:08x}, expected "
+            f"{expected:08x}"
+        )
+
+    print(
+        "OPTICAL PRIMITIVE SELF-TEST PASSED"
+    )
+    
 def self_test(
     source: str,
 ) -> None:
