@@ -680,21 +680,24 @@ void printOpticalState()
 
 
 // ============================================================
-// Primitive optical operations
+// Primitive optical operations (Hardware-in-the-Loop)
 // ============================================================
 
 bool opticalAND(bool a, bool b)
 {
   incrementOpticalEvents();
 
-  bool result = a && b;
+  driveOperandBits(a, b);
+  delayMicroseconds(VALVE_SETTLE_TIME_US);
+  sampleOpticalInputs();
+  bool result = resultBit;
 
   if (traceEnabled) {
     Serial.print(F("AND("));
     printBit(a);
     Serial.print(',');
     printBit(b);
-    Serial.print(F(")->"));
+    Serial.print(F(")->Result="));
     printBit(result);
     Serial.println();
   }
@@ -706,14 +709,17 @@ bool opticalOR(bool a, bool b)
 {
   incrementOpticalEvents();
 
-  bool result = a || b;
+  driveOperandBits(a, b);
+  delayMicroseconds(VALVE_SETTLE_TIME_US);
+  sampleOpticalInputs();
+  bool result = resultBit;
 
   if (traceEnabled) {
     Serial.print(F("OR("));
     printBit(a);
     Serial.print(',');
     printBit(b);
-    Serial.print(F(")->"));
+    Serial.print(F(")->Result="));
     printBit(result);
     Serial.println();
   }
@@ -725,14 +731,17 @@ bool opticalXOR(bool a, bool b)
 {
   incrementOpticalEvents();
 
-  bool result = a ^ b;
+  driveOperandBits(a, b);
+  delayMicroseconds(VALVE_SETTLE_TIME_US);
+  sampleOpticalInputs();
+  bool result = resultBit;
 
   if (traceEnabled) {
     Serial.print(F("XOR("));
     printBit(a);
     Serial.print(',');
     printBit(b);
-    Serial.print(F(")->"));
+    Serial.print(F(")->Result="));
     printBit(result);
     Serial.println();
   }
@@ -744,12 +753,16 @@ bool opticalNOT(bool a)
 {
   incrementOpticalEvents();
 
-  bool result = !a;
+  // For NOT, we drive operand A with the inverted state or single-valve setup
+  driveOperandBits(!a, false);
+  delayMicroseconds(VALVE_SETTLE_TIME_US);
+  sampleOpticalInputs();
+  bool result = resultBit;
 
   if (traceEnabled) {
     Serial.print(F("NOT("));
     printBit(a);
-    Serial.print(F(")->"));
+    Serial.print(F(")->Result="));
     printBit(result);
     Serial.println();
   }
@@ -1085,8 +1098,6 @@ void executeOpticalOperation()
   sampleOpticalInputs();
   incrementOperationCount();
 
-  // Drive the two operands physically through
-  // the two independent light valves.
   driveOperandBits(
     operandABit,
     operandBBit
