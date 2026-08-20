@@ -22,6 +22,13 @@ Features
 - Optical statistics
 - Simulator backend
 
+Two-photon constraint
+----------------------
+Every optical event modeled here (AND, OR, XOR, and the half-adder
+sums used inside ADD32) touches at most two input bits at a time.
+No operation anywhere accepts a 3-input tuple; ADD32's carry chain is
+built from two half-adders, each of which is strictly two-input.
+
 Example:
 
     python reduced_valve_optical_stats.py \
@@ -177,6 +184,12 @@ class SimulatedOptics:
 
     The two-valve concept is represented by reusable bit
     operations rather than unary hole-count arithmetic.
+
+    Every method here is strictly two-input: the simulator
+    never receives more than two photons/bits in a single
+    call. Anything requiring more inputs (e.g. a full adder's
+    carry chain) must be composed from multiple two-input
+    calls at a higher layer.
     """
 
     def and_bit(
@@ -196,13 +209,23 @@ class SimulatedOptics:
         values: Iterable[int],
     ) -> int:
 
-        return sum(
+        values = [
             _bit(
                 "value",
                 int(v),
             )
             for v in values
-        )
+        ]
+
+        if len(values) != 2:
+
+            raise ValueError(
+                "sum_bits is a strictly "
+                "two-photon optical event; "
+                f"got {len(values)} inputs"
+            )
+
+        return sum(values)
 
     def sample(
         self,
@@ -452,7 +475,7 @@ class ReducedValveMachine:
         )
 
     # --------------------------------------------------------
-    # BIT OPERATIONS
+    # BIT OPERATIONS (each strictly two-photon)
     # --------------------------------------------------------
 
     def and_bit(
@@ -707,68 +730,68 @@ class ReducedValveMachine:
         )
 
     # --------------------------------------------------------
-    # ADDITION
+    # ADDITION (strict two-photon / two-input gates only)
     # --------------------------------------------------------
+
+    def _half_add(
+        self,
+        a: int,
+        b: int,
+        label: str,
+    ) -> tuple[int, int]:
+        """
+        One half-adder built entirely from two-input optical
+        events: a single two-photon SUM and a single two-photon
+        AND. No operation here ever sees more than two inputs.
+        """
+
+        total = self.backend.sum_bits(
+            [a, b]
+        )
+
+        sum_bit = total & 1
+        carry_bit = int(total >= 2)
+
+        self._record(
+            f"{label}.SUM2",
+            (a, b),
+            sum_bit,
+        )
+
+        self._record(
+            f"{label}.CARRY2",
+            (a, b),
+            carry_bit,
+        )
+
+        return sum_bit, carry_bit
+
+    def _or_gate(
+        self,
+        a: int,
+        b: int,
+        label: str,
+    ) -> int:
+
+        total = self.backend.sum_bits(
+            [a, b]
+        )
+
+        result = int(total > 0)
+
+        self._record(
+            f"{label}.OR2",
+            (a, b),
+            result,
+        )
+
+        return result
 
     def _add_raw(
         self,
         a: int,
         b: int,
     ) -> int:
-
-        carry = 0
-        result = 0
-
-        for slot in range(32):
-
-            ai = (
-                a >> slot
-            ) & 1
-
-            bi = (
-                b >> slot
-            ) & 1
-
-            total = (
-                self.backend.sum_bits(
-                    [
-                        ai,
-                        bi,
-                        carry,
-                    ]
-                )
-            )
-
-            output_bit = (
-                total & 1
-            )
-
-            carry = int(
-                total >= 2
-            )
-
-            result |= (
-                output_bit
-                << slot
-            )
-
-            self._record(
-                f"ADD32[t={slot}]",
-                (
-                    ai,
-                    bi,
-                    carry,
-                ),
-                output_bit,
-            )
-
-        return result & MASK32
-
-    def _add_raw(
-        self,
-        a: int,
-        b: int,
-        ) -> int:
 
         a &= MASK32
         b &= MASK32
@@ -781,38 +804,44 @@ class ReducedValveMachine:
             ai = (a >> slot) & 1
             bi = (b >> slot) & 1
 
-            total = self.backend.sum_bits(
-                [
-                    ai,
-                    bi,
-                    carry,
-                ]
+            # Full adder = two half adders, each strictly
+            # two-input. Every optical event below is a
+            # genuine two-photon operation; nothing here
+            # ever combines three bits in a single call.
+
+            s1, c1 = self._half_add(
+                ai,
+                bi,
+                f"ADD32[t={slot}].HA1",
             )
 
-            output_bit = total & 1
+            s2, c2 = self._half_add(
+                s1,
+                carry,
+                f"ADD32[t={slot}].HA2",
+            )
 
-            next_carry = int(
-                total >= 2
+            carry_out = self._or_gate(
+                c1,
+                c2,
+                f"ADD32[t={slot}].CARRYOUT",
+            )
+
+            output_bit = s2
+
+            self._record(
+                f"ADD32[t={slot}]",
+                (ai, bi, carry),
+                output_bit,
             )
 
             result |= (
                 output_bit << slot
             )
 
-            self._record(
-                f"ADD32[t={slot}]",
-                (
-                    ai,
-                    bi,
-                    carry,
-                ),
-                output_bit,
-            )
-
-            carry = next_carry
+            carry = carry_out
 
         return result & MASK32
-
 
     def add32(
         self,
@@ -1246,8 +1275,6 @@ class ExpressionEvaluator(
 
     # --------------------------------------------------------
     # LIST
-    #
-    # THIS FIXES THE ERROR IN YOUR TRACEBACK.
     # --------------------------------------------------------
 
     def visit_List(
@@ -1309,14 +1336,6 @@ class ExpressionEvaluator(
         return self.visit(
             node.value
         )
-
-    # --------------------------------------------------------
-    # LIST REPETITION
-    #
-    # Supports:
-    #
-    #   [0] * 64
-    # --------------------------------------------------------
 
     # --------------------------------------------------------
     # UNARY
@@ -2749,7 +2768,7 @@ def primitive_self_test():
     print(
         "OPTICAL PRIMITIVE SELF-TEST PASSED"
     )
-    
+
 def self_test(
     source: str,
 ) -> None:
