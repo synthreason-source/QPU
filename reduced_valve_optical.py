@@ -1,353 +1,2879 @@
-"""Reduced-valve optical hardware abstraction layer.
-
-Uses time-multiplexed binary streams instead of unary hole-count arithmetic.
-The optical backend is optional: pass a backend object implementing
-and_bit(a, b), sum_bits(values), and sample() to OpticalBackend.
-Without hardware, the deterministic simulator provides the same API.
+#!/usr/bin/env python3
 """
+Reduced-valve optical Q compiler/interpreter.
+
+Features
+--------
+- Time-multiplexed binary optical operations
+- 32-bit arithmetic
+- AND32 / OR32 / XOR32 / NOT32
+- ADD32
+- SHR / SHL / ROTR
+- Lists
+- List indexing
+- List assignment
+- Functions
+- Return
+- If / else
+- While
+- For / range
+- SHA-256 capable Q programs
+- Optical operation tracing
+- Optical statistics
+- Simulator backend
+
+Example:
+
+    python reduced_valve_optical_stats.py \
+        --program sha256.q \
+        --input abc
+
+Self-test:
+
+    python reduced_valve_optical_stats.py \
+        --program sha256.q \
+        --self-test
+
+Trace:
+
+    python reduced_valve_optical_stats.py \
+        --program sha256.q \
+        --input abc \
+        --trace \
+        --trace-limit 100
+
+Stats:
+
+    python reduced_valve_optical_stats.py \
+        --program sha256.q \
+        --input abc \
+        --stats
+"""
+
 from __future__ import annotations
-import ast
+
 import argparse
+import ast
+import hashlib
+import sys
+
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
-MAX_LOOP_ITERATIONS = 100_000
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+
+MAX_LOOP_ITERATIONS = 1_000_000
+MASK32 = 0xFFFFFFFF
 
 
-def _nonnegative_int(name: str, value: Any) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{name} expects a nonnegative integer, got {value!r}")
+# ============================================================
+# VALIDATION
+# ============================================================
+
+def _nonnegative_int(
+    name: str,
+    value: Any,
+) -> int:
+
+    if isinstance(value, bool):
+        raise ValueError(
+            f"{name} expects an integer"
+        )
+
+    if not isinstance(value, int):
+        raise ValueError(
+            f"{name} expects an integer, "
+            f"got {value!r}"
+        )
+
+    if value < 0:
+        raise ValueError(
+            f"{name} expects a nonnegative "
+            f"integer, got {value!r}"
+        )
+
     return value
 
 
-def _bit(name: str, value: Any) -> int:
-    value = _nonnegative_int(name, value)
+def _bit(
+    name: str,
+    value: Any,
+) -> int:
+
+    value = _nonnegative_int(
+        name,
+        value,
+    )
+
     if value not in (0, 1):
-        raise ValueError(f"{name} expects a binary value, got {value!r}")
+        raise ValueError(
+            f"{name} expects 0 or 1, "
+            f"got {value!r}"
+        )
+
     return value
 
 
-def int_to_bits(value: int, width: Optional[int] = None) -> list[int]:
-    value = _nonnegative_int("value", value)
-    width = max(1, value.bit_length()) if width is None else width
-    if width < 1 or value >= (1 << width):
-        raise ValueError("width is too small for value")
-    return [(value >> i) & 1 for i in range(width)]
+def _u32(
+    value: int,
+) -> int:
+
+    return int(value) & MASK32
 
 
-def bits_to_int(bits: Iterable[int]) -> int:
+# ============================================================
+# BIT CONVERSION
+# ============================================================
+
+def int_to_bits(
+    value: int,
+    width: Optional[int] = None,
+) -> list[int]:
+
+    value = _nonnegative_int(
+        "value",
+        value,
+    )
+
+    if width is None:
+        width = max(
+            1,
+            value.bit_length(),
+        )
+
+    if width < 1:
+        raise ValueError(
+            "width must be positive"
+        )
+
+    if value >= (1 << width):
+        raise ValueError(
+            f"{value} does not fit "
+            f"in {width} bits"
+        )
+
+    return [
+        (value >> i) & 1
+        for i in range(width)
+    ]
+
+
+def bits_to_int(
+    bits: Iterable[int],
+) -> int:
+
     result = 0
-    for i, bit in enumerate(bits):
-        result |= _bit("bit", int(bit)) << i
+
+    for i, value in enumerate(bits):
+
+        result |= (
+            _bit(
+                "bit",
+                int(value),
+            )
+            << i
+        )
+
     return result
 
 
+# ============================================================
+# OPTICAL SIMULATOR
+# ============================================================
+
 class SimulatedOptics:
-    """Deterministic stand-in for a camera and a two-valve optical path."""
-    def and_bit(self, a: int, b: int) -> int:
-        return _bit("a", a) & _bit("b", b)
+    """
+    Deterministic optical hardware simulator.
 
-    def sum_bits(self, values: Iterable[int]) -> int:
-        return sum(_bit("value", int(v)) for v in values)
+    The two-valve concept is represented by reusable bit
+    operations rather than unary hole-count arithmetic.
+    """
 
-    def sample(self, value: int) -> int:
+    def and_bit(
+        self,
+        a: int,
+        b: int,
+    ) -> int:
+
+        return (
+            _bit("a", a)
+            &
+            _bit("b", b)
+        )
+
+    def sum_bits(
+        self,
+        values: Iterable[int],
+    ) -> int:
+
+        return sum(
+            _bit(
+                "value",
+                int(v),
+            )
+            for v in values
+        )
+
+    def sample(
+        self,
+        value: int,
+    ) -> int:
+
         return int(value)
 
 
-class OpticalBackend:
-    """Adapter for real hardware or a simulator.
+# ============================================================
+# OPTICAL BACKEND
+# ============================================================
 
-    A real backend must provide and_bit(a, b), sum_bits(values), and sample(value).
-    The valve_count property describes the number of reusable active valves.
-    """
-    def __init__(self, driver: Optional[Any] = None, valve_count: int = 2):
-        self.driver = driver or SimulatedOptics()
+class OpticalBackend:
+
+    def __init__(
+        self,
+        driver: Optional[Any] = None,
+        valve_count: int = 2,
+    ):
+
+        self.driver = (
+            driver
+            or SimulatedOptics()
+        )
+
         self.valve_count = valve_count
 
-    def and_bit(self, a: int, b: int) -> int:
-        return _bit("AND lhs", self.driver.and_bit(a, b))
+    def and_bit(
+        self,
+        a: int,
+        b: int,
+    ) -> int:
 
-    def sum_bits(self, values: Iterable[int]) -> int:
-        return self.driver.sum_bits(values)
+        return _bit(
+            "AND result",
+            self.driver.and_bit(
+                a,
+                b,
+            ),
+        )
 
-    def sample(self, value: int) -> int:
-        return int(self.driver.sample(value))
+    def sum_bits(
+        self,
+        values: Iterable[int],
+    ) -> int:
 
+        return int(
+            self.driver.sum_bits(values)
+        )
+
+    def sample(
+        self,
+        value: int,
+    ) -> int:
+
+        return int(
+            self.driver.sample(value)
+        )
+
+
+# ============================================================
+# OPTICAL TRACE
+# ============================================================
 
 @dataclass
 class OpticalTrace:
-    events: list[tuple[str, tuple[Any, ...], Any]] = field(default_factory=list)
 
-    def record(self, operation: str, inputs: tuple[Any, ...], result: Any) -> Any:
-        self.events.append((operation, inputs, result))
+    events: list[
+        tuple[
+            str,
+            tuple[Any, ...],
+            Any,
+        ]
+    ] = field(
+        default_factory=list
+    )
+
+    def record(
+        self,
+        operation: str,
+        inputs: tuple[Any, ...],
+        result: Any,
+    ) -> Any:
+
+        self.events.append(
+            (
+                operation,
+                inputs,
+                result,
+            )
+        )
+
         return result
+
+    def print(
+        self,
+        limit: Optional[int] = None,
+    ) -> None:
+
+        events = self.events
+
+        if limit is not None:
+            events = events[:limit]
+
+        for index, (
+            operation,
+            inputs,
+            result,
+        ) in enumerate(
+            events,
+            1,
+        ):
+
+            print(
+                f"[{index}] "
+                f"{operation}{inputs} "
+                f"-> {result}"
+            )
+
+        if (
+            limit is not None
+            and len(self.events) > limit
+        ):
+
+            print(
+                f"... "
+                f"{len(self.events) - limit} "
+                f"more events"
+            )
+
+
+# ============================================================
+# STATISTICS
+# ============================================================
+
+@dataclass
+class OpticalStats:
+
+    counts: dict[str, int] = field(
+        default_factory=dict
+    )
+
+    total_events: int = 0
+
+    def record(
+        self,
+        operation: str,
+    ) -> None:
+
+        self.total_events += 1
+
+        self.counts[operation] = (
+            self.counts.get(
+                operation,
+                0,
+            )
+            + 1
+        )
 
     def print(self) -> None:
-        for i, (op, inputs, result) in enumerate(self.events, 1):
-            print(f"[{i}] {op}{inputs} -> {result}")
 
+        print()
+        print("=" * 60)
+        print("OPTICAL STATISTICS")
+        print("=" * 60)
+
+        print(
+            f"Total optical events: "
+            f"{self.total_events}"
+        )
+
+        print()
+
+        for name, count in sorted(
+            self.counts.items(),
+            key=lambda item: (
+                -item[1],
+                item[0],
+            ),
+        ):
+
+            print(
+                f"{name:25s} "
+                f"{count:12d}"
+            )
+
+        print("=" * 60)
+
+
+# ============================================================
+# REDUCED VALVE MACHINE
+# ============================================================
 
 class ReducedValveMachine:
-    """Two-valve, time-multiplexed optical arithmetic machine."""
-    def __init__(self, backend: Optional[OpticalBackend] = None,
-                 width: Optional[int] = None, trace: Optional[OpticalTrace] = None):
-        self.backend = backend or OpticalBackend()
+
+    def __init__(
+        self,
+        backend: Optional[
+            OpticalBackend
+        ] = None,
+        width: int = 32,
+        trace: Optional[
+            OpticalTrace
+        ] = None,
+        stats: Optional[
+            OpticalStats
+        ] = None,
+    ):
+
+        self.backend = (
+            backend
+            or OpticalBackend()
+        )
+
         self.width = width
-        self.trace = trace or OpticalTrace()
 
-    def _width(self, *values: int) -> int:
-        values = [_nonnegative_int("value", v) for v in values]
-        width = self.width or max(1, *(v.bit_length() for v in values))
-        if any(v >= (1 << width) for v in values):
-            raise ValueError("value does not fit configured width")
-        return width
+        self.trace = (
+            trace
+            or OpticalTrace()
+        )
 
-    def and_bit(self, a: int, b: int) -> int:
-        result = self.backend.and_bit(a, b)
-        return self.trace.record("AND", (a, b), result)
+        self.stats = (
+            stats
+            or OpticalStats()
+        )
 
-    def or_bit(self, a: int, b: int) -> int:
-        total = self.backend.sum_bits([a, b])
+    # --------------------------------------------------------
+    # RECORD
+    # --------------------------------------------------------
+
+    def _record(
+        self,
+        operation: str,
+        inputs: tuple[Any, ...],
+        result: Any,
+    ) -> Any:
+
+        self.stats.record(
+            operation
+        )
+
+        return self.trace.record(
+            operation,
+            inputs,
+            result,
+        )
+
+    # --------------------------------------------------------
+    # BIT OPERATIONS
+    # --------------------------------------------------------
+
+    def and_bit(
+        self,
+        a: int,
+        b: int,
+    ) -> int:
+
+        result = self.backend.and_bit(
+            _bit("a", a),
+            _bit("b", b),
+        )
+
+        return self._record(
+            "AND",
+            (a, b),
+            result,
+        )
+
+    def or_bit(
+        self,
+        a: int,
+        b: int,
+    ) -> int:
+
+        total = self.backend.sum_bits(
+            [
+                _bit("a", a),
+                _bit("b", b),
+            ]
+        )
+
         result = int(total > 0)
-        return self.trace.record("OR", (a, b), result)
 
-    def xor_bit(self, a: int, b: int) -> int:
-        total = self.backend.sum_bits([a, b])
+        return self._record(
+            "OR",
+            (a, b),
+            result,
+        )
+
+    def xor_bit(
+        self,
+        a: int,
+        b: int,
+    ) -> int:
+
+        total = self.backend.sum_bits(
+            [
+                _bit("a", a),
+                _bit("b", b),
+            ]
+        )
+
         result = total & 1
-        return self.trace.record("XOR", (a, b), result)
 
-    def not_bit(self, a: int) -> int:
-        result = 1 - _bit("NOT", a)
-        return self.trace.record("NOT", (a,), result)
+        return self._record(
+            "XOR",
+            (a, b),
+            result,
+        )
 
-    def _serial_binary(self, a: int, b: int, operation: str) -> int:
-        width = self._width(a, b)
-        abits, bbits = int_to_bits(a, width), int_to_bits(b, width)
-        out = []
-        for slot, (ai, bi) in enumerate(zip(abits, bbits)):
+    def not_bit(
+        self,
+        a: int,
+    ) -> int:
+
+        result = 1 - _bit(
+            "NOT",
+            a,
+        )
+
+        return self._record(
+            "NOT",
+            (a,),
+            result,
+        )
+
+    # --------------------------------------------------------
+    # SERIAL BINARY
+    # --------------------------------------------------------
+
+    def _serial_binary(
+        self,
+        a: int,
+        b: int,
+        operation: str,
+        width: Optional[int] = None,
+    ) -> int:
+
+        width = (
+            width
+            or self.width
+        )
+
+        a = _u32(a)
+        b = _u32(b)
+
+        abits = int_to_bits(
+            a,
+            width,
+        )
+
+        bbits = int_to_bits(
+            b,
+            width,
+        )
+
+        output = []
+
+        for slot, (
+            ai,
+            bi,
+        ) in enumerate(
+            zip(
+                abits,
+                bbits,
+            )
+        ):
+
             if operation == "AND":
-                value = self.backend.and_bit(ai, bi)
+
+                value = (
+                    self.backend.and_bit(
+                        ai,
+                        bi,
+                    )
+                )
+
             elif operation == "OR":
-                value = int(self.backend.sum_bits([ai, bi]) > 0)
+
+                value = int(
+                    self.backend.sum_bits(
+                        [ai, bi]
+                    ) > 0
+                )
+
+            elif operation == "XOR":
+
+                value = (
+                    self.backend.sum_bits(
+                        [ai, bi]
+                    )
+                    & 1
+                )
+
             else:
-                value = self.backend.sum_bits([ai, bi]) & 1
-            out.append(value)
-            self.trace.record(f"{operation}[t={slot}]", (ai, bi), value)
-        return bits_to_int(out)
 
-    def add(self, a: int, b: int) -> int:
-        _nonnegative_int("ADD lhs", a); _nonnegative_int("ADD rhs", b)
-        width = max(self._width(a, b) + 1, (a + b).bit_length())
-        carry, out = 0, []
-        for slot in range(width):
-            ai = (a >> slot) & 1
-            bi = (b >> slot) & 1
-            s = self.backend.sum_bits([ai, bi, carry])
-            bit, carry = s & 1, int(s >= 2)
-            out.append(bit)
-            self.trace.record(f"ADD[t={slot}]", (ai, bi, carry), bit)
-        result = bits_to_int(out)
-        return self.trace.record("ADD", (a, b), result)
+                raise ValueError(
+                    f"unknown operation "
+                    f"{operation}"
+                )
 
-    def subtract(self, a: int, b: int) -> int:
-        _nonnegative_int("SUB lhs", a); _nonnegative_int("SUB rhs", b)
-        if b > a:
-            raise ValueError(f"cannot represent negative result: {a} - {b}")
-        width = self._width(a, b)
-        borrow, out = 0, []
-        for slot in range(width):
-            ai, bi = (a >> slot) & 1, (b >> slot) & 1
-            difference = ai - bi - borrow
-            bit = difference & 1
-            borrow = int(difference < 0)
-            out.append(bit)
-            self.trace.record(f"SUB[t={slot}]", (ai, bi, borrow), bit)
-        result = bits_to_int(out)
-        return self.trace.record("SUB", (a, b), result)
+            output.append(
+                value
+            )
 
-    def multiply(self, a: int, b: int) -> int:
-        _nonnegative_int("MUL lhs", a); _nonnegative_int("MUL rhs", b)
-        result, row = 0, a
-        shift = 0
-        while (b >> shift) > 0:
-            if ((b >> shift) & 1):
-                result = self.add(result, row)
-            self.trace.record(f"MUL[t={shift}]", (a, b), result)
-            row <<= 1
-            shift += 1
-        return self.trace.record("MUL", (a, b), result)
+            self._record(
+                f"{operation}[t={slot}]",
+                (ai, bi),
+                value,
+            )
 
-    def compare(self, a: int, b: int) -> int:
-        _nonnegative_int("CMP lhs", a); _nonnegative_int("CMP rhs", b)
-        if a == b:
-            self.trace.record("CMP", (a, b), 0)
+        return bits_to_int(
+            output
+        )
+
+    # --------------------------------------------------------
+    # 32 BIT LOGIC
+    # --------------------------------------------------------
+
+    def and32(
+        self,
+        *values: int,
+    ) -> int:
+
+        if not values:
+            return MASK32
+
+        result = _u32(
+            values[0]
+        )
+
+        for value in values[1:]:
+
+            result = (
+                self._serial_binary(
+                    result,
+                    _u32(value),
+                    "AND",
+                    32,
+                )
+                & MASK32
+            )
+
+        return self._record(
+            "AND32",
+            tuple(values),
+            result,
+        )
+
+    def or32(
+        self,
+        *values: int,
+    ) -> int:
+
+        if not values:
             return 0
-        result = 1 if a > b else -1
-        self.trace.record("CMP", (a, b), result)
-        return result
 
-    def eq(self, a: int, b: int) -> int: return int(self.compare(a, b) == 0)
-    def ne(self, a: int, b: int) -> int: return int(self.compare(a, b) != 0)
-    def lt(self, a: int, b: int) -> int: return int(self.compare(a, b) < 0)
-    def le(self, a: int, b: int) -> int: return int(self.compare(a, b) <= 0)
-    def gt(self, a: int, b: int) -> int: return int(self.compare(a, b) > 0)
-    def ge(self, a: int, b: int) -> int: return int(self.compare(a, b) >= 0)
+        result = _u32(
+            values[0]
+        )
 
-    def eval(self, expression: str, **variables: int) -> int:
-        return _ExpressionEvaluator(self, variables).visit(ast.parse(expression, mode="eval"))
+        for value in values[1:]:
 
-    def run(self, code: str, **variables: int) -> dict[str, int]:
-        _StatementExecutor(self, variables).visit(ast.parse(code, mode="exec"))
-        return variables
+            result = (
+                self._serial_binary(
+                    result,
+                    _u32(value),
+                    "OR",
+                    32,
+                )
+                & MASK32
+            )
+
+        return self._record(
+            "OR32",
+            tuple(values),
+            result,
+        )
+
+    def xor32(
+        self,
+        *values: int,
+    ) -> int:
+
+        if not values:
+            return 0
+
+        result = _u32(
+            values[0]
+        )
+
+        for value in values[1:]:
+
+            result = (
+                self._serial_binary(
+                    result,
+                    _u32(value),
+                    "XOR",
+                    32,
+                )
+                & MASK32
+            )
+
+        return self._record(
+            "XOR32",
+            tuple(values),
+            result,
+        )
+
+    def not32(
+        self,
+        value: int,
+    ) -> int:
+
+        result = (
+            ~_u32(value)
+        ) & MASK32
+
+        return self._record(
+            "NOT32",
+            (value,),
+            result,
+        )
+
+    # --------------------------------------------------------
+    # ADDITION
+    # --------------------------------------------------------
+
+    def _add_raw(
+        self,
+        a: int,
+        b: int,
+    ) -> int:
+
+        carry = 0
+        result = 0
+
+        for slot in range(32):
+
+            ai = (
+                a >> slot
+            ) & 1
+
+            bi = (
+                b >> slot
+            ) & 1
+
+            total = (
+                self.backend.sum_bits(
+                    [
+                        ai,
+                        bi,
+                        carry,
+                    ]
+                )
+            )
+
+            output_bit = (
+                total & 1
+            )
+
+            carry = int(
+                total >= 2
+            )
+
+            result |= (
+                output_bit
+                << slot
+            )
+
+            self._record(
+                f"ADD32[t={slot}]",
+                (
+                    ai,
+                    bi,
+                    carry,
+                ),
+                output_bit,
+            )
+
+        return result & MASK32
+
+    def add32(
+        self,
+        *values: int,
+    ) -> int:
+
+        result = 0
+
+        for value in values:
+
+            result = self._add_raw(
+                result,
+                _u32(value),
+            )
+
+        result &= MASK32
+
+        return self._record(
+            "ADD32",
+            tuple(values),
+            result,
+        )
+
+    # --------------------------------------------------------
+    # SUBTRACT
+    # --------------------------------------------------------
+
+    def subtract(
+        self,
+        a: int,
+        b: int,
+    ) -> int:
+
+        result = (
+            _u32(a)
+            -
+            _u32(b)
+        ) & MASK32
+
+        return self._record(
+            "SUB32",
+            (a, b),
+            result,
+        )
+
+    # --------------------------------------------------------
+    # SHIFTS
+    # --------------------------------------------------------
+
+    def shr(
+        self,
+        value: int,
+        amount: int,
+    ) -> int:
+
+        value = _u32(value)
+        amount = int(amount)
+
+        if amount >= 32:
+            result = 0
+        else:
+            result = (
+                value >> amount
+            )
+
+        return self._record(
+            "SHR",
+            (value, amount),
+            result,
+        )
+
+    def shl(
+        self,
+        value: int,
+        amount: int,
+    ) -> int:
+
+        result = (
+            _u32(value)
+            << int(amount)
+        ) & MASK32
+
+        return self._record(
+            "SHL",
+            (value, amount),
+            result,
+        )
+
+    def rotr(
+        self,
+        value: int,
+        amount: int,
+    ) -> int:
+
+        value = _u32(value)
+
+        amount %= 32
+
+        if amount == 0:
+
+            result = value
+
+        else:
+
+            result = (
+                (value >> amount)
+                |
+                (
+                    value
+                    << (32 - amount)
+                )
+            ) & MASK32
+
+        return self._record(
+            "ROTR",
+            (value, amount),
+            result,
+        )
+
+    # --------------------------------------------------------
+    # MULTIPLY
+    # --------------------------------------------------------
+
+    def multiply(
+        self,
+        a: int,
+        b: int,
+    ) -> int:
+
+        result = 0
+        row = _u32(a)
+
+        b = _u32(b)
+
+        shift = 0
+
+        while (
+            b >> shift
+        ):
+
+            if (
+                (b >> shift) & 1
+            ):
+
+                result = self.add32(
+                    result,
+                    row,
+                )
+
+            row = (
+                row << 1
+            ) & MASK32
+
+            shift += 1
+
+        return self._record(
+            "MUL32",
+            (a, b),
+            result,
+        )
+
+    # --------------------------------------------------------
+    # COMPARISON
+    # --------------------------------------------------------
+
+    def compare(
+        self,
+        a: int,
+        b: int,
+    ) -> int:
+
+        if a == b:
+            result = 0
+
+        elif a > b:
+            result = 1
+
+        else:
+            result = -1
+
+        return self._record(
+            "CMP",
+            (a, b),
+            result,
+        )
+
+    def eq(self, a, b):
+        return int(
+            self.compare(a, b) == 0
+        )
+
+    def ne(self, a, b):
+        return int(
+            self.compare(a, b) != 0
+        )
+
+    def lt(self, a, b):
+        return int(
+            self.compare(a, b) < 0
+        )
+
+    def le(self, a, b):
+        return int(
+            self.compare(a, b) <= 0
+        )
+
+    def gt(self, a, b):
+        return int(
+            self.compare(a, b) > 0
+        )
+
+    def ge(self, a, b):
+        return int(
+            self.compare(a, b) >= 0
+        )
 
 
-class Bit:
-    def __init__(self, value: int, machine: Optional[ReducedValveMachine] = None):
-        self.value = _nonnegative_int("Bit", value)
-        self.machine = machine or ReducedValveMachine()
+# ============================================================
+# Q RUNTIME
+# ============================================================
 
-    def _other(self, other: Any) -> int:
-        return other.value if isinstance(other, Bit) else _nonnegative_int("operand", int(other))
+class QRuntime:
 
-    def _new(self, value: int) -> "Bit": return Bit(value, self.machine)
-    def __and__(self, o): return self._new(self.machine._serial_binary(self.value, self._other(o), "AND"))
-    def __or__(self, o): return self._new(self.machine._serial_binary(self.value, self._other(o), "OR"))
-    def __xor__(self, o): return self._new(self.machine._serial_binary(self.value, self._other(o), "XOR"))
-    def __invert__(self): return self._new(self.machine.not_bit(self.value))
-    def __add__(self, o): return self._new(self.machine.add(self.value, self._other(o)))
-    def __sub__(self, o): return self._new(self.machine.subtract(self.value, self._other(o)))
-    def __mul__(self, o): return self._new(self.machine.multiply(self.value, self._other(o)))
-    def __int__(self): return self.value
-    def __bool__(self): return bool(self.value)
-    def __repr__(self): return f"Bit({self.value})"
-    def __eq__(self, o): return bool(self.machine.eq(self.value, self._other(o)))
-    def __ne__(self, o): return bool(self.machine.ne(self.value, self._other(o)))
-    def __lt__(self, o): return bool(self.machine.lt(self.value, self._other(o)))
-    def __le__(self, o): return bool(self.machine.le(self.value, self._other(o)))
-    def __gt__(self, o): return bool(self.machine.gt(self.value, self._other(o)))
-    def __ge__(self, o): return bool(self.machine.ge(self.value, self._other(o)))
+    def __init__(
+        self,
+        machine: ReducedValveMachine,
+        data: bytes,
+    ):
+
+        self.machine = machine
+        self.data = bytes(data)
+
+    def byte(
+        self,
+        index: int,
+    ) -> int:
+
+        index = int(index)
+
+        if (
+            index < 0
+            or index >= len(self.data)
+        ):
+
+            return 0
+
+        return self.data[index]
+
+    def length(self) -> int:
+
+        return len(self.data)
+
+    def padded(
+        self,
+    ) -> bytes:
+
+        message = bytearray(
+            self.data
+        )
+
+        bit_length = (
+            len(message)
+            * 8
+        )
+
+        message.append(
+            0x80
+        )
+
+        while (
+            len(message) % 64
+            != 56
+        ):
+
+            message.append(
+                0
+            )
+
+        message.extend(
+            bit_length.to_bytes(
+                8,
+                "big",
+            )
+        )
+
+        return bytes(message)
+
+    def word(
+        self,
+        index: int,
+    ) -> int:
+
+        data = self.padded()
+
+        offset = (
+            int(index)
+            * 4
+        )
+
+        if (
+            offset + 4
+            > len(data)
+        ):
+
+            return 0
+
+        return int.from_bytes(
+            data[
+                offset:
+                offset + 4
+            ],
+            "big",
+        )
+
+    def word_count(
+        self,
+    ) -> int:
+
+        return (
+            len(self.padded())
+            // 4
+        )
 
 
-class _ExpressionEvaluator(ast.NodeVisitor):
-    BIN = {ast.BitAnd: "and_bit", ast.BitOr: "or_bit", ast.BitXor: "xor_bit",
-           ast.Add: "add", ast.Sub: "subtract", ast.Mult: "multiply"}
-    BOOL = {ast.And: "and_bit", ast.Or: "or_bit"}
-    CMP = {ast.Eq: "eq", ast.NotEq: "ne", ast.Lt: "lt", ast.LtE: "le", ast.Gt: "gt", ast.GtE: "ge"}
+# ============================================================
+# Q CONTROL EXCEPTIONS
+# ============================================================
 
-    def __init__(self, machine, variables): self.machine, self.variables = machine, variables
-    def visit_Expression(self, n): return self.visit(n.body)
-    def visit_Name(self, n): return _nonnegative_int(n.id, self.variables[n.id])
-    def visit_Constant(self, n): return _nonnegative_int("literal", n.value)
-    def visit_BinOp(self, n):
-        if type(n.op) not in self.BIN: raise SyntaxError("unsupported operator")
-        return getattr(self.machine, self.BIN[type(n.op)])(self.visit(n.left), self.visit(n.right))
-    def visit_BoolOp(self, n):
-        values = [self.visit(v) for v in n.values]; result = values[0]
-        for value in values[1:]: result = getattr(self.machine, self.BOOL[type(n.op)])(result, value)
-        return result
-    def visit_UnaryOp(self, n):
-        if not isinstance(n.op, (ast.Invert, ast.Not)): raise SyntaxError("use ~ or not")
-        return self.machine.not_bit(self.visit(n.operand))
-    def visit_Compare(self, n):
-        left, result = self.visit(n.left), 1
-        for op, node in zip(n.ops, n.comparators):
-            right = self.visit(node)
-            result = self.machine.and_bit(result, getattr(self.machine, self.CMP[type(op)])(left, right))
+class QReturn(Exception):
+
+    def __init__(
+        self,
+        value: Any,
+    ):
+
+        self.value = value
+
+
+class QBreak(Exception):
+    pass
+
+
+class QContinue(Exception):
+    pass
+
+
+# ============================================================
+# Q FUNCTIONS
+# ============================================================
+
+@dataclass
+class QFunction:
+
+    node: ast.FunctionDef
+
+
+# ============================================================
+# EXPRESSION EVALUATOR
+# ============================================================
+
+class ExpressionEvaluator(
+    ast.NodeVisitor
+):
+
+    def __init__(
+        self,
+        machine: ReducedValveMachine,
+        variables: dict[str, Any],
+        functions: dict[str, QFunction],
+        runtime: QRuntime,
+        executor: "StatementExecutor",
+    ):
+
+        self.machine = machine
+        self.variables = variables
+        self.functions = functions
+        self.runtime = runtime
+        self.executor = executor
+
+    # --------------------------------------------------------
+    # CONSTANT
+    # --------------------------------------------------------
+
+    def visit_Constant(
+        self,
+        node: ast.Constant,
+    ):
+
+        if isinstance(
+            node.value,
+            (
+                int,
+                str,
+                bytes,
+            ),
+        ):
+
+            return node.value
+
+        if node.value is None:
+
+            return None
+
+        raise SyntaxError(
+            f"unsupported constant: "
+            f"{node.value!r}"
+        )
+
+    # --------------------------------------------------------
+    # VARIABLE
+    # --------------------------------------------------------
+
+    def visit_Name(
+        self,
+        node: ast.Name,
+    ):
+
+        if (
+            node.id
+            not in self.variables
+        ):
+
+            raise NameError(
+                f"undefined Q variable: "
+                f"{node.id}"
+            )
+
+        return self.variables[
+            node.id
+        ]
+
+    # --------------------------------------------------------
+    # LIST
+    #
+    # THIS FIXES THE ERROR IN YOUR TRACEBACK.
+    # --------------------------------------------------------
+
+    def visit_List(
+        self,
+        node: ast.List,
+    ):
+
+        return [
+            self.visit(element)
+            for element in node.elts
+        ]
+
+    # --------------------------------------------------------
+    # TUPLE
+    # --------------------------------------------------------
+
+    def visit_Tuple(
+        self,
+        node: ast.Tuple,
+    ):
+
+        return tuple(
+            self.visit(element)
+            for element in node.elts
+        )
+
+    # --------------------------------------------------------
+    # INDEXING
+    #
+    # Supports:
+    #
+    #   K[j]
+    #   w[j]
+    #   state[0]
+    # --------------------------------------------------------
+
+    def visit_Subscript(
+        self,
+        node: ast.Subscript,
+    ):
+
+        container = self.visit(
+            node.value
+        )
+
+        index = self.visit(
+            node.slice
+        )
+
+        return container[index]
+
+    # Python 3.11 compatibility.
+
+    def visit_Index(
+        self,
+        node: ast.Index,
+    ):
+
+        return self.visit(
+            node.value
+        )
+
+    # --------------------------------------------------------
+    # LIST REPETITION
+    #
+    # Supports:
+    #
+    #   [0] * 64
+    # --------------------------------------------------------
+
+    # --------------------------------------------------------
+    # UNARY
+    # --------------------------------------------------------
+
+    def visit_UnaryOp(
+        self,
+        node: ast.UnaryOp,
+    ):
+
+        value = self.visit(
+            node.operand
+        )
+
+        if isinstance(
+            node.op,
+            ast.Invert,
+        ):
+
+            return self.machine.not32(
+                value
+            )
+
+        if isinstance(
+            node.op,
+            ast.USub,
+        ):
+
+            return (
+                -int(value)
+            ) & MASK32
+
+        if isinstance(
+            node.op,
+            ast.UAdd,
+        ):
+
+            return int(value)
+
+        if isinstance(
+            node.op,
+            ast.Not,
+        ):
+
+            return int(
+                not value
+            )
+
+        raise SyntaxError(
+            "unsupported unary operation"
+        )
+
+    # --------------------------------------------------------
+    # BINARY
+    # --------------------------------------------------------
+
+    def visit_BinOp(
+        self,
+        node: ast.BinOp,
+    ):
+
+        left = self.visit(
+            node.left
+        )
+
+        right = self.visit(
+            node.right
+        )
+
+        # List repetition.
+
+        if isinstance(
+            node.op,
+            ast.Mult,
+        ):
+
+            if isinstance(
+                left,
+                list,
+            ) and isinstance(
+                right,
+                int,
+            ):
+
+                return left * right
+
+            if isinstance(
+                right,
+                list,
+            ) and isinstance(
+                left,
+                int,
+            ):
+
+                return right * left
+
+        # String/list concatenation.
+
+        if isinstance(
+            node.op,
+            ast.Add,
+        ) and (
+            isinstance(left, list)
+            or isinstance(right, list)
+            or isinstance(left, str)
+            or isinstance(right, str)
+        ):
+
+            return left + right
+
+        if isinstance(
+            node.op,
+            ast.BitAnd,
+        ):
+
+            return self.machine.and32(
+                left,
+                right,
+            )
+
+        if isinstance(
+            node.op,
+            ast.BitOr,
+        ):
+
+            return self.machine.or32(
+                left,
+                right,
+            )
+
+        if isinstance(
+            node.op,
+            ast.BitXor,
+        ):
+
+            return self.machine.xor32(
+                left,
+                right,
+            )
+
+        if isinstance(
+            node.op,
+            ast.Add,
+        ):
+
+            return self.machine.add32(
+                left,
+                right,
+            )
+
+        if isinstance(
+            node.op,
+            ast.Sub,
+        ):
+
+            return self.machine.subtract(
+                left,
+                right,
+            )
+
+        if isinstance(
+            node.op,
+            ast.LShift,
+        ):
+
+            return self.machine.shl(
+                left,
+                right,
+            )
+
+        if isinstance(
+            node.op,
+            ast.RShift,
+        ):
+
+            return self.machine.shr(
+                left,
+                right,
+            )
+
+        if isinstance(
+            node.op,
+            ast.Mod,
+        ):
+
+            return left % right
+
+        if isinstance(
+            node.op,
+            ast.Mult,
+        ):
+
+            return left * right
+
+        raise SyntaxError(
+            "unsupported binary operator"
+        )
+
+    # --------------------------------------------------------
+    # BOOLEAN
+    # --------------------------------------------------------
+
+    def visit_BoolOp(
+        self,
+        node: ast.BoolOp,
+    ):
+
+        values = [
+            self.visit(v)
+            for v in node.values
+        ]
+
+        if isinstance(
+            node.op,
+            ast.And,
+        ):
+
+            return int(
+                all(values)
+            )
+
+        if isinstance(
+            node.op,
+            ast.Or,
+        ):
+
+            return int(
+                any(values)
+            )
+
+        raise SyntaxError(
+            "unsupported boolean operator"
+        )
+
+    # --------------------------------------------------------
+    # COMPARISON
+    # --------------------------------------------------------
+
+    def visit_Compare(
+        self,
+        node: ast.Compare,
+    ):
+
+        left = self.visit(
+            node.left
+        )
+
+        result = True
+
+        for op, comparator in zip(
+            node.ops,
+            node.comparators,
+        ):
+
+            right = self.visit(
+                comparator
+            )
+
+            if isinstance(
+                op,
+                ast.Eq,
+            ):
+
+                current = (
+                    left == right
+                )
+
+            elif isinstance(
+                op,
+                ast.NotEq,
+            ):
+
+                current = (
+                    left != right
+                )
+
+            elif isinstance(
+                op,
+                ast.Lt,
+            ):
+
+                current = (
+                    left < right
+                )
+
+            elif isinstance(
+                op,
+                ast.LtE,
+            ):
+
+                current = (
+                    left <= right
+                )
+
+            elif isinstance(
+                op,
+                ast.Gt,
+            ):
+
+                current = (
+                    left > right
+                )
+
+            elif isinstance(
+                op,
+                ast.GtE,
+            ):
+
+                current = (
+                    left >= right
+                )
+
+            else:
+
+                raise SyntaxError(
+                    "unsupported comparison"
+                )
+
+            result = (
+                result
+                and current
+            )
+
             left = right
-        return result
-    def generic_visit(self, n): raise SyntaxError(f"unsupported syntax: {type(n).__name__}")
+
+        return int(result)
+
+    # --------------------------------------------------------
+    # CALL
+    # --------------------------------------------------------
+
+    def visit_Call(
+        self,
+        node: ast.Call,
+    ):
+
+        if not isinstance(
+            node.func,
+            ast.Name,
+        ):
+
+            raise SyntaxError(
+                "Q only permits "
+                "named function calls"
+            )
+
+        name = node.func.id
+
+        args = [
+            self.visit(arg)
+            for arg in node.args
+        ]
+
+        # Optical primitives.
+
+        if name == "ADD32":
+
+            return self.machine.add32(
+                *args
+            )
+
+        if name == "AND32":
+
+            return self.machine.and32(
+                *args
+            )
+
+        if name == "OR32":
+
+            return self.machine.or32(
+                *args
+            )
+
+        if name == "XOR32":
+
+            return self.machine.xor32(
+                *args
+            )
+
+        if name == "NOT32":
+
+            return self.machine.not32(
+                args[0]
+            )
+
+        if name == "ROTR":
+
+            return self.machine.rotr(
+                args[0],
+                args[1],
+            )
+
+        if name == "SHR":
+
+            return self.machine.shr(
+                args[0],
+                args[1],
+            )
+
+        if name == "SHL":
+
+            return self.machine.shl(
+                args[0],
+                args[1],
+            )
+
+        # Runtime input.
+
+        if name == "BYTE":
+
+            return self.runtime.byte(
+                args[0]
+            )
+
+        if name == "INPUT_LENGTH":
+
+            return self.runtime.length()
+
+        if name == "INPUT_WORD":
+
+            return self.runtime.word(
+                args[0]
+            )
+
+        if name == "WORD_COUNT":
+
+            return self.runtime.word_count()
+
+        # Helpers.
+
+        if name == "len":
+
+            return len(args[0])
+
+        if name == "range":
+
+            return range(*args)
+
+        if name == "int":
+
+            return int(args[0])
+
+        if name == "U32":
+
+            return _u32(
+                args[0]
+            )
+
+        # User function.
+
+        if name in self.functions:
+
+            return self.executor.call_function(
+                self.functions[name],
+                args,
+            )
+
+        raise NameError(
+            f"unknown Q function: "
+            f"{name}"
+        )
+
+    # --------------------------------------------------------
+    # OTHERWISE
+    # --------------------------------------------------------
+
+    def generic_visit(
+        self,
+        node,
+    ):
+
+        raise SyntaxError(
+            f"unsupported syntax: "
+            f"{type(node).__name__}"
+        )
 
 
-class _Break(Exception): pass
-class _Continue(Exception): pass
+# ============================================================
+# STATEMENT EXECUTOR
+# ============================================================
 
-class _StatementExecutor(ast.NodeVisitor):
-    def __init__(self, machine, variables): self.machine, self.variables = machine, variables
-    def evaluate(self, node): return _ExpressionEvaluator(self.machine, self.variables).visit(node)
-    def visit_Module(self, n):
-        for statement in n.body: self.visit(statement)
-    def visit_Pass(self, n): pass
-    def visit_Break(self, n): raise _Break()
-    def visit_Continue(self, n): raise _Continue()
-    def visit_Assign(self, n):
-        if len(n.targets) != 1 or not isinstance(n.targets[0], ast.Name): raise SyntaxError("simple assignments only")
-        self.variables[n.targets[0].id] = self.evaluate(n.value)
-    def visit_AugAssign(self, n):
-        if not isinstance(n.target, ast.Name): raise SyntaxError("simple augmented assignments only")
-        op = _ExpressionEvaluator.BIN.get(type(n.op))
-        if op is None: raise SyntaxError("unsupported augmented operator")
-        self.variables[n.target.id] = getattr(self.machine, op)(self.variables[n.target.id], self.evaluate(n.value))
-    def visit_Expr(self, n):
-        if isinstance(n.value, ast.Call) and isinstance(n.value.func, ast.Name) and n.value.func.id == "print":
-            print(" ".join(str(self.evaluate(arg)) for arg in n.value.args)); return
-        self.evaluate(n.value)
-    def visit_If(self, n):
-        for test, body in [(n.test, n.body)]:
-            if self.evaluate(test):
-                for s in body: self.visit(s)
+class StatementExecutor(
+    ast.NodeVisitor
+):
+
+    def __init__(
+        self,
+        machine: ReducedValveMachine,
+        variables: Optional[
+            dict[str, Any]
+        ] = None,
+        runtime: Optional[
+            QRuntime
+        ] = None,
+        functions: Optional[
+            dict[str, QFunction]
+        ] = None,
+    ):
+
+        self.machine = machine
+
+        self.variables = (
+            variables
+            if variables is not None
+            else {}
+        )
+
+        self.runtime = runtime
+
+        self.functions = (
+            functions
+            if functions is not None
+            else {}
+        )
+
+    def evaluate(
+        self,
+        node,
+    ):
+
+        return ExpressionEvaluator(
+            self.machine,
+            self.variables,
+            self.functions,
+            self.runtime,
+            self,
+        ).visit(node)
+
+    # --------------------------------------------------------
+    # MODULE
+    # --------------------------------------------------------
+
+    def visit_Module(
+        self,
+        node: ast.Module,
+    ):
+
+        for statement in node.body:
+
+            self.visit(
+                statement
+            )
+
+    # --------------------------------------------------------
+    # FUNCTION
+    # --------------------------------------------------------
+
+    def visit_FunctionDef(
+        self,
+        node: ast.FunctionDef,
+    ):
+
+        self.functions[
+            node.name
+        ] = QFunction(node)
+
+    # --------------------------------------------------------
+    # FUNCTION CALL
+    # --------------------------------------------------------
+
+    def call_function(
+        self,
+        function: QFunction,
+        args: list[Any],
+    ):
+
+        node = function.node
+
+        expected = len(
+            node.args.args
+        )
+
+        if len(args) != expected:
+
+            raise TypeError(
+                f"{node.name} expects "
+                f"{expected} arguments, "
+                f"got {len(args)}"
+            )
+
+        local = dict(
+            self.variables
+        )
+
+        for argument, value in zip(
+            node.args.args,
+            args,
+        ):
+
+            local[
+                argument.arg
+            ] = value
+
+        child = StatementExecutor(
+            self.machine,
+            local,
+            self.runtime,
+            self.functions,
+        )
+
+        try:
+
+            for statement in node.body:
+
+                child.visit(
+                    statement
+                )
+
+        except QReturn as returned:
+
+            return returned.value
+
+        return None
+
+    # --------------------------------------------------------
+    # RETURN
+    # --------------------------------------------------------
+
+    def visit_Return(
+        self,
+        node: ast.Return,
+    ):
+
+        value = (
+            self.evaluate(
+                node.value
+            )
+            if node.value is not None
+            else None
+        )
+
+        raise QReturn(
+            value
+        )
+
+    # --------------------------------------------------------
+    # ASSIGNMENT
+    # --------------------------------------------------------
+
+    def visit_Assign(
+        self,
+        node: ast.Assign,
+    ):
+
+        value = self.evaluate(
+            node.value
+        )
+
+        for target in node.targets:
+
+            self.assign(
+                target,
+                value,
+            )
+
+    # --------------------------------------------------------
+    # ASSIGN TARGET
+    # --------------------------------------------------------
+
+    def assign(
+        self,
+        target,
+        value,
+    ):
+
+        # x = value
+
+        if isinstance(
+            target,
+            ast.Name,
+        ):
+
+            self.variables[
+                target.id
+            ] = value
+
+            return
+
+        # w[j] = value
+
+        if isinstance(
+            target,
+            ast.Subscript,
+        ):
+
+            container = self.evaluate(
+                target.value
+            )
+
+            index = self.evaluate(
+                target.slice
+            )
+
+            container[
+                index
+            ] = value
+
+            return
+
+        raise SyntaxError(
+            "unsupported assignment target"
+        )
+
+    # --------------------------------------------------------
+    # AUGMENTED ASSIGNMENT
+    # --------------------------------------------------------
+
+    def visit_AugAssign(
+        self,
+        node: ast.AugAssign,
+    ):
+
+        # Simple variable +=.
+
+        if isinstance(
+            node.target,
+            ast.Name,
+        ):
+
+            name = node.target.id
+
+            lhs = self.variables[
+                name
+            ]
+
+            rhs = self.evaluate(
+                node.value
+            )
+
+            if isinstance(
+                node.op,
+                ast.Add,
+            ):
+
+                value = (
+                    self.machine.add32(
+                        lhs,
+                        rhs,
+                    )
+                )
+
+            elif isinstance(
+                node.op,
+                ast.Sub,
+            ):
+
+                value = (
+                    self.machine.subtract(
+                        lhs,
+                        rhs,
+                    )
+                )
+
+            elif isinstance(
+                node.op,
+                ast.BitXor,
+            ):
+
+                value = (
+                    self.machine.xor32(
+                        lhs,
+                        rhs,
+                    )
+                )
+
+            elif isinstance(
+                node.op,
+                ast.BitAnd,
+            ):
+
+                value = (
+                    self.machine.and32(
+                        lhs,
+                        rhs,
+                    )
+                )
+
+            elif isinstance(
+                node.op,
+                ast.BitOr,
+            ):
+
+                value = (
+                    self.machine.or32(
+                        lhs,
+                        rhs,
+                    )
+                )
+
+            else:
+
+                raise SyntaxError(
+                    "unsupported "
+                    "augmented operator"
+                )
+
+            self.variables[
+                name
+            ] = value
+
+            return
+
+        # w[j] += value
+
+        if isinstance(
+            node.target,
+            ast.Subscript,
+        ):
+
+            container = self.evaluate(
+                node.target.value
+            )
+
+            index = self.evaluate(
+                node.target.slice
+            )
+
+            lhs = container[index]
+
+            rhs = self.evaluate(
+                node.value
+            )
+
+            if isinstance(
+                node.op,
+                ast.Add,
+            ):
+
+                container[index] = (
+                    self.machine.add32(
+                        lhs,
+                        rhs,
+                    )
+                )
+
                 return
-        for s in n.orelse: self.visit(s)
-    def visit_While(self, n):
-        count = 0
-        while self.evaluate(n.test):
-            count += 1
-            if count > MAX_LOOP_ITERATIONS: raise RuntimeError("loop limit exceeded")
+
+            if isinstance(
+                node.op,
+                ast.BitXor,
+            ):
+
+                container[index] = (
+                    self.machine.xor32(
+                        lhs,
+                        rhs,
+                    )
+                )
+
+                return
+
+            raise SyntaxError(
+                "unsupported indexed "
+                "augmented operator"
+            )
+
+        raise SyntaxError(
+            "unsupported augmented "
+            "assignment"
+        )
+
+    # --------------------------------------------------------
+    # EXPRESSION STATEMENT
+    # --------------------------------------------------------
+
+    def visit_Expr(
+        self,
+        node: ast.Expr,
+    ):
+
+        if isinstance(
+            node.value,
+            ast.Call,
+        ):
+
+            if (
+                isinstance(
+                    node.value.func,
+                    ast.Name,
+                )
+                and node.value.func.id
+                == "print"
+            ):
+
+                values = [
+                    self.evaluate(
+                        arg
+                    )
+                    for arg
+                    in node.value.args
+                ]
+
+                print(
+                    *values
+                )
+
+                return
+
+            if (
+                isinstance(
+                    node.value.func,
+                    ast.Name,
+                )
+                and node.value.func.id
+                == "print_hex"
+            ):
+
+                value = self.evaluate(
+                    node.value.args[0]
+                )
+
+                print(
+                    f"{_u32(value):08x}"
+                )
+
+                return
+
+            if (
+                isinstance(
+                    node.value.func,
+                    ast.Name,
+                )
+                and node.value.func.id
+                == "print_digest"
+            ):
+
+                values = [
+                    self.evaluate(
+                        arg
+                    )
+                    for arg
+                    in node.value.args
+                ]
+
+                print(
+                    "".join(
+                        f"{_u32(value):08x}"
+                        for value
+                        in values
+                    )
+                )
+
+                return
+
+        self.evaluate(
+            node.value
+        )
+
+    # --------------------------------------------------------
+    # IF
+    # --------------------------------------------------------
+
+    def visit_If(
+        self,
+        node: ast.If,
+    ):
+
+        if self.evaluate(
+            node.test
+        ):
+
+            for statement in node.body:
+
+                self.visit(
+                    statement
+                )
+
+        else:
+
+            for statement in node.orelse:
+
+                self.visit(
+                    statement
+                )
+
+    # --------------------------------------------------------
+    # WHILE
+    # --------------------------------------------------------
+
+    def visit_While(
+        self,
+        node: ast.While,
+    ):
+
+        iterations = 0
+
+        while self.evaluate(
+            node.test
+        ):
+
+            iterations += 1
+
+            if (
+                iterations
+                > MAX_LOOP_ITERATIONS
+            ):
+
+                raise RuntimeError(
+                    "Q loop limit exceeded"
+                )
+
             try:
-                for s in n.body: self.visit(s)
-            except _Break: break
-            except _Continue: continue
-    def visit_For(self, n):
-        if not isinstance(n.target, ast.Name): raise SyntaxError("simple for targets only")
-        if not (isinstance(n.iter, ast.Call) and isinstance(n.iter.func, ast.Name) and n.iter.func.id == "range"):
-            raise SyntaxError("for loops require range(...)")
-        bounds = [self.evaluate(a) for a in n.iter.args]
-        for value in range(*bounds):
-            self.variables[n.target.id] = value
+
+                for statement in node.body:
+
+                    self.visit(
+                        statement
+                    )
+
+            except QBreak:
+
+                break
+
+            except QContinue:
+
+                continue
+
+    # --------------------------------------------------------
+    # FOR
+    # --------------------------------------------------------
+
+    def visit_For(
+        self,
+        node: ast.For,
+    ):
+
+        if not isinstance(
+            node.target,
+            ast.Name,
+        ):
+
+            raise SyntaxError(
+                "Q for target must "
+                "be a variable"
+            )
+
+        iterable = self.evaluate(
+            node.iter
+        )
+
+        for value in iterable:
+
+            self.variables[
+                node.target.id
+            ] = value
+
             try:
-                for s in n.body: self.visit(s)
-            except _Break: break
-            except _Continue: continue
-    def generic_visit(self, n): raise SyntaxError(f"unsupported statement: {type(n).__name__}")
+
+                for statement in node.body:
+
+                    self.visit(
+                        statement
+                    )
+
+            except QBreak:
+
+                break
+
+            except QContinue:
+
+                continue
+
+    # --------------------------------------------------------
+    # BREAK
+    # --------------------------------------------------------
+
+    def visit_Break(
+        self,
+        node: ast.Break,
+    ):
+
+        raise QBreak()
+
+    # --------------------------------------------------------
+    # CONTINUE
+    # --------------------------------------------------------
+
+    def visit_Continue(
+        self,
+        node: ast.Continue,
+    ):
+
+        raise QContinue()
+
+    # --------------------------------------------------------
+    # PASS
+    # --------------------------------------------------------
+
+    def visit_Pass(
+        self,
+        node: ast.Pass,
+    ):
+
+        pass
+
+    # --------------------------------------------------------
+    # UNSUPPORTED
+    # --------------------------------------------------------
+
+    def generic_visit(
+        self,
+        node,
+    ):
+
+        raise SyntaxError(
+            f"unsupported Q statement: "
+            f"{type(node).__name__}"
+        )
 
 
-def optical_eval(expression: str, **variables: int) -> tuple[int, OpticalTrace]:
-    machine = ReducedValveMachine()
-    result = machine.eval(expression, **variables)
-    return result, machine.trace
+# ============================================================
+# Q VALIDATOR
+# ============================================================
+
+FORBIDDEN_NODES = (
+    ast.Import,
+    ast.ImportFrom,
+    ast.ClassDef,
+    ast.AsyncFunctionDef,
+    ast.AsyncFor,
+    ast.AsyncWith,
+    ast.With,
+    ast.Try,
+    ast.Raise,
+    ast.Delete,
+    ast.Global,
+    ast.Nonlocal,
+    ast.Lambda,
+    ast.Yield,
+    ast.YieldFrom,
+)
 
 
-def optical_run(code: str, **variables: int) -> tuple[dict[str, int], OpticalTrace]:
-    machine = ReducedValveMachine()
-    result = machine.run(code, **variables)
-    return result, machine.trace
+BUILTIN_CALLS = {
+    "ADD32",
+    "AND32",
+    "OR32",
+    "XOR32",
+    "NOT32",
+    "ROTR",
+    "SHR",
+    "SHL",
+    "BYTE",
+    "INPUT_LENGTH",
+    "INPUT_WORD",
+    "WORD_COUNT",
+    "U32",
+    "len",
+    "range",
+    "int",
+    "print",
+    "print_hex",
+    "print_digest",
+}
 
 
-def demo() -> None:
-    machine = ReducedValveMachine(width=8)
-    a, b = Bit(13, machine), Bit(6, machine)
-    print("13 + 6 =", a + b)
-    print("13 * 6 =", a * b)
-    print("13 & 6 =", a & b)
-    print("13 | 6 =", a | b)
-    print("13 ^ 6 =", a ^ b)
-    print("exposures/events:", len(machine.trace.events))
-    machine.trace.print()
+def validate_q(
+    tree: ast.AST,
+) -> None:
 
+    functions = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(
+            node,
+            ast.FunctionDef,
+        )
+    }
+
+    allowed_calls = (
+        BUILTIN_CALLS
+        | functions
+    )
+
+    for node in ast.walk(tree):
+
+        if isinstance(
+            node,
+            FORBIDDEN_NODES,
+        ):
+
+            raise SyntaxError(
+                "forbidden Q construct: "
+                f"{type(node).__name__}"
+            )
+
+        if isinstance(
+            node,
+            ast.Call,
+        ):
+
+            if not isinstance(
+                node.func,
+                ast.Name,
+            ):
+
+                raise SyntaxError(
+                    "Q requires named "
+                    "function calls"
+                )
+
+            if (
+                node.func.id
+                not in allowed_calls
+            ):
+
+                raise SyntaxError(
+                    f"unknown Q function: "
+                    f"{node.func.id}"
+                )
+
+
+# ============================================================
+# Q RUNNER
+# ============================================================
+
+def run_q(
+    source: str,
+    data: bytes,
+    trace: Optional[
+        OpticalTrace
+    ] = None,
+    statistics: Optional[
+        OpticalStats
+    ] = None,
+):
+
+    machine = ReducedValveMachine(
+        width=32,
+        trace=(
+            trace
+            or OpticalTrace()
+        ),
+        stats=(
+            statistics
+            or OpticalStats()
+        ),
+    )
+
+    runtime = QRuntime(
+        machine,
+        data,
+    )
+
+    variables = {}
+
+    tree = ast.parse(
+        source,
+        filename="<Q>",
+        mode="exec",
+    )
+
+    validate_q(
+        tree
+    )
+
+    executor = StatementExecutor(
+        machine,
+        variables,
+        runtime,
+    )
+
+    executor.visit(
+        tree
+    )
+
+    return (
+        variables,
+        machine,
+    )
+
+
+# ============================================================
+# SHA-256 RESULT
+# ============================================================
+
+def extract_sha256(
+    variables: dict[str, Any],
+) -> str:
+
+    names = (
+        "h0",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "h7",
+    )
+
+    missing = [
+        name
+        for name in names
+        if name not in variables
+    ]
+
+    if missing:
+
+        raise RuntimeError(
+            "Q program did not produce "
+            "SHA-256 state variables: "
+            + ", ".join(missing)
+        )
+
+    return "".join(
+        f"{_u32(variables[name]):08x}"
+        for name in names
+    )
+
+
+# ============================================================
+# SELF TEST
+# ============================================================
+
+def self_test(
+    source: str,
+) -> None:
+
+    tests = [
+        b"",
+        b"a",
+        b"abc",
+        b"hello",
+        b"hello world",
+        b"The quick brown fox jumps over the lazy dog",
+        b"The quick brown fox jumps over the lazy dog.",
+        b"a" * 55,
+        b"a" * 56,
+        b"a" * 57,
+        b"a" * 63,
+        b"a" * 64,
+        b"a" * 65,
+        b"a" * 127,
+        b"a" * 128,
+        b"a" * 129,
+        b"a" * 1000,
+    ]
+
+    for data in tests:
+
+        variables, machine = run_q(
+            source,
+            data,
+        )
+
+        got = extract_sha256(
+            variables
+        )
+
+        expected = hashlib.sha256(
+            data
+        ).hexdigest()
+
+        if got != expected:
+
+            print()
+            print(
+                "SHA-256 FAILURE"
+            )
+
+            print(
+                f"length : {len(data)}"
+            )
+
+            print(
+                f"Q      : {got}"
+            )
+
+            print(
+                f"hashlib: {expected}"
+            )
+
+            raise SystemExit(1)
+
+        print(
+            f"PASS "
+            f"{len(data):5d} bytes "
+            f"{got}"
+        )
+
+    print()
+    print(
+        "ALL Q SHA-256 TESTS PASSED"
+    )
+
+
+# ============================================================
+# INPUT
+# ============================================================
+
+def load_input(
+    args,
+) -> bytes:
+
+    if args.input is not None:
+
+        return args.input.encode(
+            "utf-8"
+        )
+
+    if args.file:
+
+        with open(
+            args.file,
+            "rb",
+        ) as f:
+
+            return f.read()
+
+    if args.hex is not None:
+
+        return bytes.fromhex(
+            args.hex
+        )
+
+    if args.stdin:
+
+        return sys.stdin.buffer.read()
+
+    return b""
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Reduced-valve optical Q compiler"
+        )
+    )
+
+    parser.add_argument(
+        "--program",
+        "-p",
+        required=True,
+        help="Q source file",
+    )
+
+    parser.add_argument(
+        "--input",
+        help="UTF-8 input string",
+    )
+
+    parser.add_argument(
+        "--file",
+        "-f",
+        help="binary input file",
+    )
+
+    parser.add_argument(
+        "--hex",
+        help="hexadecimal input",
+    )
+
+    parser.add_argument(
+        "--stdin",
+        action="store_true",
+        help="read input from stdin",
+    )
+
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="print optical trace",
+    )
+
+    parser.add_argument(
+        "--trace-limit",
+        type=int,
+        default=100,
+        help="maximum trace events displayed",
+    )
+
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="print optical statistics",
+    )
+
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="test Q SHA-256 against hashlib",
+    )
+
+    args = parser.parse_args()
+
+    with open(
+        args.program,
+        "r",
+        encoding="utf-8",
+    ) as f:
+
+        source = f.read()
+
+    if args.self_test:
+
+        self_test(
+            source
+        )
+
+        return
+
+    data = load_input(
+        args
+    )
+
+    trace = OpticalTrace()
+    statistics = OpticalStats()
+
+    variables, machine = run_q(
+        source,
+        data,
+        trace=trace,
+        statistics=statistics,
+    )
+
+    # If the program produced SHA-256
+    # state, print it.
+
+    sha_names = (
+        "h0",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "h7",
+    )
+
+    if all(
+        name in variables
+        for name in sha_names
+    ):
+
+        print(
+            extract_sha256(
+                variables
+            )
+        )
+
+    else:
+
+        print(
+            variables
+        )
+
+    if args.stats:
+
+        statistics.print()
+
+    if args.trace:
+
+        print()
+        print(
+            f"Trace events: "
+            f"{len(trace.events)}"
+        )
+
+        trace.print(
+            args.trace_limit
+        )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Reduced-valve optical computing interpreter")
-    parser.add_argument("--expr", help="evaluate one expression")
-    parser.add_argument("--program", help="execute a program file")
-    parser.add_argument("--demo", action="store_true")
-    parser.add_argument("values", nargs="*", help="initial values such as a=13")
-    args = parser.parse_args()
-    values = {k: int(v) for item in args.values for k, v in [item.split("=", 1)]}
-    if args.demo: demo()
-    elif args.expr:
-        result, trace = optical_eval(args.expr, **values)
-        print(result); trace.print()
-    elif args.program:
-        variables, trace = optical_run(open(args.program, encoding="utf-8").read(), **values)
-        print(variables); trace.print()
-    else:
-        parser.print_help()
+    main()
