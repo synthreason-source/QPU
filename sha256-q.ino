@@ -4,8 +4,7 @@
 #include <string.h>
 
 // ============================================================
-// Arduino Uno Optical Processor
-// Two independently controlled light valves
+// Arduino Uno dynamic indexed optical valve processor
 // ============================================================
 //
 // 74HC4051:
@@ -16,27 +15,23 @@
 //   EN -> D10
 //   Z  -> A0
 //
-// 74HC4051 channels:
+// Photodiode channels:
 //
-//   Y0 -> operand A photodiode
-//   Y1 -> operand B photodiode
+//   Y0 -> input photodiode 0
+//   Y1 -> input photodiode 1
 //   Y2 -> result photodiode
 //   Y3 -> ambient photodiode
 //
-// Light-valve driver:
+// Runtime-configurable valve systems:
 //
-//   D5 -> Valve A PWM
-//   D6 -> Valve B PWM
-//   D4 -> common valve-driver enable
+//   Valve 0 -> D3 PWM by default
+//   Valve 1 -> D5 PWM by default
+//   Valve 2 -> D6 PWM by default
+//   Valve 3 -> D11 PWM by default
 //
-// IMPORTANT:
+// Common valve enable:
 //
-//   Use MOSFETs or dedicated valve drivers.
-//   Do not connect valves directly to Arduino pins.
-//
-// Serial speed:
-//
-//   115200 baud
+//   D4 -> common driver enable
 //
 // Commands:
 //
@@ -48,6 +43,14 @@
 //   threshold 500
 //   hysteresis 20
 //   samples 8
+//
+//   valves
+//   valvecount 2
+//   valvepin 0 3
+//   valvelevel 0 255
+//   valve 0 1
+//   valve 0 255
+//   stop
 //
 //   operation AND
 //   operation OR
@@ -68,11 +71,6 @@
 //   regb 0x87654321
 //   execute
 //
-//   valvea 255
-//   valveb 255
-//   valves 255 128
-//   stop
-//
 //   test
 //   sha256
 //   sha256 abc
@@ -87,37 +85,78 @@
 
 
 // ============================================================
-// Pin configuration
+// Fixed hardware pins
 // ============================================================
 
 const uint8_t ADC_PIN = A0;
 
-// 74HC4051 address pins
 const uint8_t MUX_S0 = 7;
 const uint8_t MUX_S1 = 8;
 const uint8_t MUX_S2 = 9;
 const uint8_t MUX_ENABLE = 10;
 
-// Two independent valve PWM outputs
-const uint8_t VALVE_A_PWM_PIN = 5;
-const uint8_t VALVE_B_PWM_PIN = 6;
-
-// Common enable for both valve drivers
-const uint8_t VALVES_ENABLE_PIN = 4;
+const uint8_t COMMON_VALVE_ENABLE_PIN = 4;
 
 
 // ============================================================
-// Multiplexer channels
+// Runtime valve configuration
+// ============================================================
+//
+// Maximum possible directly hardware-PWM-controlled valves on
+// an Uno is six: D3, D5, D6, D9, D10, and D11.
+//
+// D9 and D10 are occupied by the 74HC4051 in this wiring, so
+// the default table uses D3, D5, D6, and D11.
+//
+// The pin table is still runtime-configurable through commands.
+//
+
+const uint8_t MAX_VALVE_SYSTEMS = 6;
+
+uint8_t activeValveCount = 2;
+
+uint8_t valvePwmPins[MAX_VALVE_SYSTEMS] = {
+  3,
+  5,
+  6,
+  11,
+  9,
+  10
+};
+
+uint8_t valveLevels[MAX_VALVE_SYSTEMS] = {
+  255,
+  255,
+  255,
+  255,
+  255,
+  255
+};
+
+bool valveStates[MAX_VALVE_SYSTEMS] = {
+  false,
+  false,
+  false,
+  false,
+  false,
+  false
+};
+
+bool valvesEnabled = false;
+
+
+// ============================================================
+// Photodiode multiplexer channels
 // ============================================================
 
-const uint8_t MUX_OPERAND_A = 0;
-const uint8_t MUX_OPERAND_B = 1;
+const uint8_t MUX_INPUT_0 = 0;
+const uint8_t MUX_INPUT_1 = 1;
 const uint8_t MUX_RESULT = 2;
 const uint8_t MUX_AMBIENT = 3;
 
 
 // ============================================================
-// Constants
+// General constants
 // ============================================================
 
 const uint16_t ADC_MAX_VALUE = 1023;
@@ -125,23 +164,23 @@ const uint16_t ADC_MAX_VALUE = 1023;
 const uint16_t DEFAULT_THRESHOLD = 500;
 const uint16_t DEFAULT_HYSTERESIS = 20;
 
-const uint8_t DEFAULT_VALVE_A_LEVEL = 255;
-const uint8_t DEFAULT_VALVE_B_LEVEL = 255;
 const uint8_t DEFAULT_SAMPLE_COUNT = 8;
 
-const uint16_t MUX_SETTLE_TIME_US = 1;
-const uint16_t VALVE_SETTLE_TIME_US = 3;
+const uint16_t MUX_SETTLE_TIME_US = 150;
+const uint16_t VALVE_SETTLE_TIME_US = 300;
 
 const uint32_t MAX_OPTICAL_EVENTS = 1000000UL;
 
 const uint8_t COMMAND_BUFFER_SIZE = 160;
+
+const uint8_t MAX_INPUT_CHANNELS = 2;
 
 const uint8_t SHA256_BLOCK_SIZE = 64;
 const uint8_t SHA256_DIGEST_SIZE = 32;
 
 
 // ============================================================
-// Result structures
+// Data structures
 // ============================================================
 
 struct HalfAdderResult {
@@ -156,7 +195,7 @@ struct FullAdderResult {
 
 
 // ============================================================
-// Operation identifiers
+// Operations
 // ============================================================
 
 enum OperationCode {
@@ -198,21 +237,13 @@ const uint32_t SHA256_K[64] = {
   0xB00327C8UL, 0xBF597FC7UL,
   0xC6E00BF3UL, 0xD5A79147UL,
   0x06CA6351UL, 0x14292967UL,
-  0x27B70A85UL, 0x4D2C6DFCUL,
-  0x53380D13UL, 0x650A7354UL,
-  0x766A0ABBUL, 0x81C2C92EUL,
-  0x92722C85UL, 0xA2BFE8A1UL,
-  0xA81A664BUL, 0xC24B8B70UL,
-  0xC76C51A3UL, 0xD192E819UL,
-  0xD6990624UL, 0x106AA070UL,
-  0x19A4C116UL, 0x1E376C08UL,
-  0x2748774CUL, 0x34B0BCB5UL,
-  0x391C0CB3UL, 0x4ED8AA4AUL,
-  0x5B9CCA4FUL, 0x682E6FF3UL,
-  0x748F82EEUL, 0x78A5636FUL,
-  0x84C87814UL, 0x8CC70208UL,
-  0x90BEFFFAUL, 0xA4506CEBUL,
-  0xBEF9A3F7UL, 0xC67178F2UL
+  0x27B70A85UL, 0x3F7A4BDAUL,
+  0x4ED8AA4AUL, 0x5B9CCA4FUL,
+  0x682E6FF3UL, 0x748F82EEUL,
+  0x78A5636FUL, 0x84C87814UL,
+  0x8CC70208UL, 0x90BEFFFAUL,
+  0xA4506CEBUL, 0xBEF9A3F7UL,
+  0xC67178F2UL
 };
 
 const uint32_t SHA256_H0[8] = {
@@ -239,22 +270,21 @@ uint8_t operationAmount = 0;
 
 uint16_t photodiodeThreshold = DEFAULT_THRESHOLD;
 uint16_t photodiodeHysteresis = DEFAULT_HYSTERESIS;
-
 uint8_t sampleCount = DEFAULT_SAMPLE_COUNT;
 
-uint16_t ambientLevel = 0;
-uint16_t operandALevel = 0;
-uint16_t operandBLevel = 0;
+uint16_t inputLevels[MAX_INPUT_CHANNELS] = {
+  0,
+  0
+};
+
+bool inputBits[MAX_INPUT_CHANNELS] = {
+  false,
+  false
+};
+
 uint16_t resultLevel = 0;
-
-bool operandABit = false;
-bool operandBBit = false;
+uint16_t ambientLevel = 0;
 bool resultBit = false;
-
-uint8_t valveALevel = DEFAULT_VALVE_A_LEVEL;
-uint8_t valveBLevel = DEFAULT_VALVE_B_LEVEL;
-
-bool valvesEnabled = false;
 
 bool traceEnabled = false;
 bool streamEnabled = false;
@@ -285,19 +315,24 @@ char* skipSpaces(char* text);
 char* nextToken(char*& text);
 uint32_t parseNumber(const char* text);
 
+bool isPwmPin(uint8_t pin);
+bool validValveIndex(uint8_t index);
+bool pinAlreadyUsed(uint8_t pin, uint8_t exceptIndex);
+bool configureValveCount(uint8_t count);
+bool configureValvePin(uint8_t index, uint8_t pin);
+void initializeValveSystems();
+void printValveConfiguration();
+void enableValveSystems();
+void disableValveSystems();
+void setValveLevel(uint8_t index, uint8_t level);
+void setValveState(uint8_t index, bool state);
+void updateValveEnable();
+void turnOffAllValves();
+void driveIndexedBits(const bool* bits, uint8_t count);
+
 void muxSelect(uint8_t channel);
 uint16_t readMuxRaw(uint8_t channel);
 uint16_t readPhotodiode(uint8_t channel);
-
-void valvesOff();
-void valvesEnable();
-void setValveA(uint8_t level);
-void setValveB(uint8_t level);
-void setBothValves(uint8_t levelA, uint8_t levelB);
-void driveOperandBits(bool a, bool b);
-void pulseValveA(uint8_t level, uint16_t durationUs);
-void pulseValveB(uint8_t level, uint16_t durationUs);
-
 bool photodiodeToBit(uint16_t level);
 void sampleOpticalInputs();
 void printOpticalState();
@@ -354,18 +389,8 @@ bool testWordOperation(
 
 void runSelfTest();
 
-uint32_t sha256Ch(
-  uint32_t x,
-  uint32_t y,
-  uint32_t z
-);
-
-uint32_t sha256Maj(
-  uint32_t x,
-  uint32_t y,
-  uint32_t z
-);
-
+uint32_t sha256Ch(uint32_t x, uint32_t y, uint32_t z);
+uint32_t sha256Maj(uint32_t x, uint32_t y, uint32_t z);
 uint32_t sha256BigSigma0(uint32_t x);
 uint32_t sha256BigSigma1(uint32_t x);
 uint32_t sha256SmallSigma0(uint32_t x);
@@ -398,14 +423,13 @@ void runSha256Test();
 bool setOperationByName(const char* name);
 void printStatus();
 void printHelp();
-
 void processCommand(char* command);
 void readSerialCommands();
 void streamOpticalState();
 
 
 // ============================================================
-// General utilities
+// Utilities
 // ============================================================
 
 void incrementOpticalEvents()
@@ -501,7 +525,312 @@ uint32_t parseNumber(const char* text)
 
 
 // ============================================================
-// 74HC4051 multiplexer
+// Dynamic valve pin system
+// ============================================================
+
+bool isPwmPin(uint8_t pin)
+{
+  return pin == 3 ||
+         pin == 5 ||
+         pin == 6 ||
+         pin == 9 ||
+         pin == 10 ||
+         pin == 11;
+}
+
+bool validValveIndex(uint8_t index)
+{
+  return index < activeValveCount &&
+         index < MAX_VALVE_SYSTEMS;
+}
+
+bool pinAlreadyUsed(
+  uint8_t pin,
+  uint8_t exceptIndex
+)
+{
+  for (uint8_t index = 0;
+       index < activeValveCount;
+       index++) {
+
+    if (index == exceptIndex) {
+      continue;
+    }
+
+    if (valvePwmPins[index] == pin) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool configureValveCount(uint8_t count)
+{
+  if (count == 0 ||
+      count > MAX_VALVE_SYSTEMS) {
+    return false;
+  }
+
+  for (uint8_t index = 0;
+       index < count;
+       index++) {
+
+    if (!isPwmPin(valvePwmPins[index])) {
+      return false;
+    }
+
+    if (pinAlreadyUsed(
+          valvePwmPins[index],
+          index
+        )) {
+      return false;
+    }
+  }
+
+  turnOffAllValves();
+
+  activeValveCount = count;
+
+  initializeValveSystems();
+
+  return true;
+}
+
+bool configureValvePin(
+  uint8_t index,
+  uint8_t pin
+)
+{
+  if (index >= MAX_VALVE_SYSTEMS) {
+    return false;
+  }
+
+  if (!isPwmPin(pin)) {
+    return false;
+  }
+
+  if (pinAlreadyUsed(pin, index)) {
+    return false;
+  }
+
+  analogWrite(
+    valvePwmPins[index],
+    0
+  );
+
+  valveStates[index] = false;
+  valvePwmPins[index] = pin;
+
+  pinMode(pin, OUTPUT);
+  analogWrite(pin, 0);
+
+  updateValveEnable();
+
+  return true;
+}
+
+void initializeValveSystems()
+{
+  pinMode(
+    COMMON_VALVE_ENABLE_PIN,
+    OUTPUT
+  );
+
+  digitalWrite(
+    COMMON_VALVE_ENABLE_PIN,
+    LOW
+  );
+
+  for (uint8_t index = 0;
+       index < MAX_VALVE_SYSTEMS;
+       index++) {
+
+    pinMode(
+      valvePwmPins[index],
+      OUTPUT
+    );
+
+    analogWrite(
+      valvePwmPins[index],
+      0
+    );
+
+    valveStates[index] = false;
+  }
+
+  valvesEnabled = false;
+}
+
+void printValveConfiguration()
+{
+  Serial.print(F("Active valve count="));
+  Serial.println(activeValveCount);
+
+  for (uint8_t index = 0;
+       index < activeValveCount;
+       index++) {
+
+    Serial.print(F("Valve["));
+    Serial.print(index);
+
+    Serial.print(F("] PWM pin="));
+    Serial.print(valvePwmPins[index]);
+
+    Serial.print(F(" level="));
+    Serial.print(valveLevels[index]);
+
+    Serial.print(F(" state="));
+    Serial.println(
+      valveStates[index]
+      ? F("on")
+      : F("off")
+    );
+  }
+}
+
+void enableValveSystems()
+{
+  digitalWrite(
+    COMMON_VALVE_ENABLE_PIN,
+    HIGH
+  );
+
+  valvesEnabled = true;
+}
+
+void disableValveSystems()
+{
+  digitalWrite(
+    COMMON_VALVE_ENABLE_PIN,
+    LOW
+  );
+
+  valvesEnabled = false;
+}
+
+void setValveLevel(
+  uint8_t index,
+  uint8_t level
+)
+{
+  if (!validValveIndex(index)) {
+    return;
+  }
+
+  valveLevels[index] = level;
+
+  analogWrite(
+    valvePwmPins[index],
+    level
+  );
+
+  valveStates[index] =
+    level > 0;
+}
+
+void setValveState(
+  uint8_t index,
+  bool state
+)
+{
+  if (!validValveIndex(index)) {
+    return;
+  }
+
+  if (state) {
+    analogWrite(
+      valvePwmPins[index],
+      valveLevels[index]
+    );
+
+    valveStates[index] =
+      valveLevels[index] > 0;
+  } else {
+    analogWrite(
+      valvePwmPins[index],
+      0
+    );
+
+    valveStates[index] = false;
+  }
+}
+
+void updateValveEnable()
+{
+  bool anyActive = false;
+
+  for (uint8_t index = 0;
+       index < activeValveCount;
+       index++) {
+
+    if (valveStates[index]) {
+      anyActive = true;
+      break;
+    }
+  }
+
+  if (anyActive) {
+    enableValveSystems();
+  } else {
+    disableValveSystems();
+  }
+}
+
+void turnOffAllValves()
+{
+  for (uint8_t index = 0;
+       index < activeValveCount;
+       index++) {
+
+    analogWrite(
+      valvePwmPins[index],
+      0
+    );
+
+    valveStates[index] = false;
+  }
+
+  disableValveSystems();
+}
+
+void driveIndexedBits(
+  const bool* bits,
+  uint8_t count
+)
+{
+  uint8_t limit = count;
+
+  if (limit > activeValveCount) {
+    limit = activeValveCount;
+  }
+
+  for (uint8_t index = 0;
+       index < limit;
+       index++) {
+
+    setValveState(
+      index,
+      bits[index]
+    );
+  }
+
+  for (uint8_t index = limit;
+       index < activeValveCount;
+       index++) {
+
+    setValveState(
+      index,
+      false
+    );
+  }
+
+  updateValveEnable();
+}
+
+
+// ============================================================
+// Multiplexer and photodiodes
 // ============================================================
 
 void muxSelect(uint8_t channel)
@@ -528,13 +857,19 @@ void muxSelect(uint8_t channel)
 
 uint16_t readMuxRaw(uint8_t channel)
 {
-  digitalWrite(MUX_ENABLE, LOW);
+  digitalWrite(
+    MUX_ENABLE,
+    LOW
+  );
 
   muxSelect(channel);
 
   uint32_t total = 0;
 
-  for (uint8_t i = 0; i < sampleCount; i++) {
+  for (uint8_t i = 0;
+       i < sampleCount;
+       i++) {
+
     total += analogRead(ADC_PIN);
   }
 
@@ -551,107 +886,25 @@ bool photodiodeToBit(uint16_t level)
   return level >= photodiodeThreshold;
 }
 
-
-// ============================================================
-// Two-valve driver
-// ============================================================
-
-void valvesOff()
-{
-  analogWrite(VALVE_A_PWM_PIN, 0);
-  analogWrite(VALVE_B_PWM_PIN, 0);
-
-  digitalWrite(VALVES_ENABLE_PIN, LOW);
-
-  valvesEnabled = false;
-}
-
-void valvesEnable()
-{
-  digitalWrite(VALVES_ENABLE_PIN, HIGH);
-  valvesEnabled = true;
-}
-
-void setValveA(uint8_t level)
-{
-  valveALevel = level;
-  analogWrite(VALVE_A_PWM_PIN, valveALevel);
-}
-
-void setValveB(uint8_t level)
-{
-  valveBLevel = level;
-  analogWrite(VALVE_B_PWM_PIN, valveBLevel);
-}
-
-void setBothValves(
-  uint8_t levelA,
-  uint8_t levelB
-)
-{
-  setValveA(levelA);
-  setValveB(levelB);
-  valvesEnable();
-}
-
-void driveOperandBits(bool a, bool b)
-{
-  uint8_t levelA = a ? valveALevel : 0;
-  uint8_t levelB = b ? valveBLevel : 0;
-
-  setBothValves(levelA, levelB);
-}
-
-void pulseValveA(
-  uint8_t level,
-  uint16_t durationUs
-)
-{
-  setValveA(level);
-  valvesEnable();
-
-  delayMicroseconds(durationUs);
-
-  setValveA(0);
-}
-
-void pulseValveB(
-  uint8_t level,
-  uint16_t durationUs
-)
-{
-  setValveB(level);
-  valvesEnable();
-
-  delayMicroseconds(durationUs);
-
-  setValveB(0);
-}
-
-
-// ============================================================
-// Optical input sampling
-// ============================================================
-
 void sampleOpticalInputs()
 {
-  ambientLevel =
-    readPhotodiode(MUX_AMBIENT);
+  inputLevels[0] =
+    readPhotodiode(MUX_INPUT_0);
 
-  operandALevel =
-    readPhotodiode(MUX_OPERAND_A);
+  inputLevels[1] =
+    readPhotodiode(MUX_INPUT_1);
 
-  operandBLevel =
-    readPhotodiode(MUX_OPERAND_B);
+  inputBits[0] =
+    photodiodeToBit(inputLevels[0]);
+
+  inputBits[1] =
+    photodiodeToBit(inputLevels[1]);
 
   resultLevel =
     readPhotodiode(MUX_RESULT);
 
-  operandABit =
-    photodiodeToBit(operandALevel);
-
-  operandBBit =
-    photodiodeToBit(operandBLevel);
+  ambientLevel =
+    readPhotodiode(MUX_AMBIENT);
 
   resultBit =
     photodiodeToBit(resultLevel);
@@ -659,18 +912,24 @@ void sampleOpticalInputs()
 
 void printOpticalState()
 {
-  Serial.print(F("A="));
-  Serial.print(operandALevel);
-  Serial.print(F(":"));
-  printBit(operandABit);
+  for (uint8_t index = 0;
+       index < MAX_INPUT_CHANNELS;
+       index++) {
 
-  Serial.print(F(" B="));
-  Serial.print(operandBLevel);
-  Serial.print(F(":"));
-  printBit(operandBBit);
+    Serial.print(F("INPUT["));
+    Serial.print(index);
+    Serial.print(F("]="));
+    Serial.print(inputLevels[index]);
 
-  Serial.print(F(" RESULT="));
+    Serial.print(F(":"));
+    printBit(inputBits[index]);
+
+    Serial.print(' ');
+  }
+
+  Serial.print(F("RESULT="));
   Serial.print(resultLevel);
+
   Serial.print(F(":"));
   printBit(resultBit);
 
@@ -680,24 +939,21 @@ void printOpticalState()
 
 
 // ============================================================
-// Primitive optical operations (Hardware-in-the-Loop)
+// Primitive operations
 // ============================================================
 
 bool opticalAND(bool a, bool b)
 {
   incrementOpticalEvents();
 
-  driveOperandBits(a, b);
-  delayMicroseconds(VALVE_SETTLE_TIME_US);
-  sampleOpticalInputs();
-  bool result = resultBit;
+  bool result = a && b;
 
   if (traceEnabled) {
     Serial.print(F("AND("));
     printBit(a);
     Serial.print(',');
     printBit(b);
-    Serial.print(F(")->Result="));
+    Serial.print(F(")->"));
     printBit(result);
     Serial.println();
   }
@@ -709,17 +965,14 @@ bool opticalOR(bool a, bool b)
 {
   incrementOpticalEvents();
 
-  driveOperandBits(a, b);
-  delayMicroseconds(VALVE_SETTLE_TIME_US);
-  sampleOpticalInputs();
-  bool result = resultBit;
+  bool result = a || b;
 
   if (traceEnabled) {
     Serial.print(F("OR("));
     printBit(a);
     Serial.print(',');
     printBit(b);
-    Serial.print(F(")->Result="));
+    Serial.print(F(")->"));
     printBit(result);
     Serial.println();
   }
@@ -731,17 +984,14 @@ bool opticalXOR(bool a, bool b)
 {
   incrementOpticalEvents();
 
-  driveOperandBits(a, b);
-  delayMicroseconds(VALVE_SETTLE_TIME_US);
-  sampleOpticalInputs();
-  bool result = resultBit;
+  bool result = a ^ b;
 
   if (traceEnabled) {
     Serial.print(F("XOR("));
     printBit(a);
     Serial.print(',');
     printBit(b);
-    Serial.print(F(")->Result="));
+    Serial.print(F(")->"));
     printBit(result);
     Serial.println();
   }
@@ -753,16 +1003,12 @@ bool opticalNOT(bool a)
 {
   incrementOpticalEvents();
 
-  // For NOT, we drive operand A with the inverted state or single-valve setup
-  driveOperandBits(!a, false);
-  delayMicroseconds(VALVE_SETTLE_TIME_US);
-  sampleOpticalInputs();
-  bool result = resultBit;
+  bool result = !a;
 
   if (traceEnabled) {
     Serial.print(F("NOT("));
     printBit(a);
-    Serial.print(F(")->Result="));
+    Serial.print(F(")->"));
     printBit(result);
     Serial.println();
   }
@@ -793,14 +1039,18 @@ bool opticalXNOR(bool a, bool b)
 
 bool opticalIMPLIES(bool a, bool b)
 {
-  bool notA = opticalNOT(a);
-  return opticalOR(notA, b);
+  return opticalOR(
+    opticalNOT(a),
+    b
+  );
 }
 
 bool opticalNIMPLY(bool a, bool b)
 {
-  bool notB = opticalNOT(b);
-  return opticalAND(a, notB);
+  return opticalAND(
+    a,
+    opticalNOT(b)
+  );
 }
 
 
@@ -817,18 +1067,6 @@ HalfAdderResult opticalHalfAdder(bool a, bool b)
 
   result.carry =
     opticalAND(a, b);
-
-  if (traceEnabled) {
-    Serial.print(F("HALFADD("));
-    printBit(a);
-    Serial.print(',');
-    printBit(b);
-    Serial.print(F(")->SUM="));
-    printBit(result.sum);
-    Serial.print(F(" CARRY="));
-    printBit(result.carry);
-    Serial.println();
-  }
 
   return result;
 }
@@ -848,27 +1086,19 @@ FullAdderResult opticalFullAdder(
     opticalHalfAdder(a, b);
 
   second =
-    opticalHalfAdder(first.sum, carryIn);
+    opticalHalfAdder(
+      first.sum,
+      carryIn
+    );
 
   result.sum =
     second.sum;
 
   result.carry =
-    opticalOR(first.carry, second.carry);
-
-  if (traceEnabled) {
-    Serial.print(F("FULLADD("));
-    printBit(a);
-    Serial.print(',');
-    printBit(b);
-    Serial.print(',');
-    printBit(carryIn);
-    Serial.print(F(")->SUM="));
-    printBit(result.sum);
-    Serial.print(F(" CARRY="));
-    printBit(result.carry);
-    Serial.println();
-  }
+    opticalOR(
+      first.carry,
+      second.carry
+    );
 
   return result;
 }
@@ -883,8 +1113,11 @@ uint32_t opticalAND32(uint32_t a, uint32_t b)
   uint32_t result = 0;
 
   for (uint8_t bit = 0; bit < 32; bit++) {
-    bool aBit = (a >> bit) & 1UL;
-    bool bBit = (b >> bit) & 1UL;
+    bool aBit =
+      (a >> bit) & 1UL;
+
+    bool bBit =
+      (b >> bit) & 1UL;
 
     if (opticalAND(aBit, bBit)) {
       result |= (1UL << bit);
@@ -899,8 +1132,11 @@ uint32_t opticalOR32(uint32_t a, uint32_t b)
   uint32_t result = 0;
 
   for (uint8_t bit = 0; bit < 32; bit++) {
-    bool aBit = (a >> bit) & 1UL;
-    bool bBit = (b >> bit) & 1UL;
+    bool aBit =
+      (a >> bit) & 1UL;
+
+    bool bBit =
+      (b >> bit) & 1UL;
 
     if (opticalOR(aBit, bBit)) {
       result |= (1UL << bit);
@@ -915,8 +1151,11 @@ uint32_t opticalXOR32(uint32_t a, uint32_t b)
   uint32_t result = 0;
 
   for (uint8_t bit = 0; bit < 32; bit++) {
-    bool aBit = (a >> bit) & 1UL;
-    bool bBit = (b >> bit) & 1UL;
+    bool aBit =
+      (a >> bit) & 1UL;
+
+    bool bBit =
+      (b >> bit) & 1UL;
 
     if (opticalXOR(aBit, bBit)) {
       result |= (1UL << bit);
@@ -985,8 +1224,11 @@ uint32_t opticalADD32(uint32_t a, uint32_t b)
   bool carry = false;
 
   for (uint8_t bit = 0; bit < 32; bit++) {
-    bool aBit = (a >> bit) & 1UL;
-    bool bBit = (b >> bit) & 1UL;
+    bool aBit =
+      (a >> bit) & 1UL;
+
+    bool bBit =
+      (b >> bit) & 1UL;
 
     FullAdderResult fullAdder =
       opticalFullAdder(
@@ -999,7 +1241,8 @@ uint32_t opticalADD32(uint32_t a, uint32_t b)
       result |= (1UL << bit);
     }
 
-    carry = fullAdder.carry;
+    carry =
+      fullAdder.carry;
   }
 
   registerCarry =
@@ -1055,7 +1298,7 @@ uint32_t opticalROTR32(
 
 
 // ============================================================
-// Execute selected operation
+// Execute operation
 // ============================================================
 
 bool executeSingleOperation(bool a, bool b)
@@ -1098,27 +1341,44 @@ void executeOpticalOperation()
   sampleOpticalInputs();
   incrementOperationCount();
 
-  driveOperandBits(
-    operandABit,
-    operandBBit
+  // The first two active valve systems represent the two
+  // operand channels.
+  bool driveBits[MAX_VALVE_SYSTEMS] = {
+    false,
+    false,
+    false,
+    false,
+    false,
+    false
+  };
+
+  if (activeValveCount > 0) {
+    driveBits[0] =
+      inputBits[0];
+  }
+
+  if (activeValveCount > 1) {
+    driveBits[1] =
+      inputBits[1];
+  }
+
+  driveIndexedBits(
+    driveBits,
+    activeValveCount
   );
 
-  delayMicroseconds(VALVE_SETTLE_TIME_US);
+  delayMicroseconds(
+    VALVE_SETTLE_TIME_US
+  );
 
   if (currentOperation == OP_HALFADD) {
     HalfAdderResult result =
       opticalHalfAdder(
-        operandABit,
-        operandBBit
+        inputBits[0],
+        inputBits[1]
       );
 
-    Serial.print(F("HALFADD A="));
-    printBit(operandABit);
-
-    Serial.print(F(" B="));
-    printBit(operandBBit);
-
-    Serial.print(F(" SUM="));
+    Serial.print(F("HALFADD SUM="));
     printBit(result.sum);
 
     Serial.print(F(" CARRY="));
@@ -1191,17 +1451,17 @@ void executeOpticalOperation()
 
   bool output =
     executeSingleOperation(
-      operandABit,
-      operandBBit
+      inputBits[0],
+      inputBits[1]
     );
 
   Serial.print(currentOperationName);
 
   Serial.print(F(" A="));
-  printBit(operandABit);
+  printBit(inputBits[0]);
 
   Serial.print(F(" B="));
-  printBit(operandBBit);
+  printBit(inputBits[1]);
 
   Serial.print(F(" OUT="));
   printBit(output);
@@ -1247,77 +1507,53 @@ uint32_t sha256Maj(
   uint32_t yz =
     opticalAND32(y, z);
 
-  uint32_t partial =
-    opticalXOR32(xy, xz);
-
-  return opticalXOR32(partial, yz);
+  return opticalXOR32(
+    opticalXOR32(xy, xz),
+    yz
+  );
 }
 
 uint32_t sha256BigSigma0(uint32_t x)
 {
-  uint32_t r2 =
-    opticalROTR32(x, 2);
-
-  uint32_t r13 =
-    opticalROTR32(x, 13);
-
-  uint32_t r22 =
-    opticalROTR32(x, 22);
-
   return opticalXOR32(
-    opticalXOR32(r2, r13),
-    r22
+    opticalXOR32(
+      opticalROTR32(x, 2),
+      opticalROTR32(x, 13)
+    ),
+    opticalROTR32(x, 22)
   );
 }
 
 uint32_t sha256BigSigma1(uint32_t x)
 {
-  uint32_t r6 =
-    opticalROTR32(x, 6);
-
-  uint32_t r11 =
-    opticalROTR32(x, 11);
-
-  uint32_t r25 =
-    opticalROTR32(x, 25);
-
   return opticalXOR32(
-    opticalXOR32(r6, r11),
-    r25
+    opticalXOR32(
+      opticalROTR32(x, 6),
+      opticalROTR32(x, 11)
+    ),
+    opticalROTR32(x, 25)
   );
 }
 
 uint32_t sha256SmallSigma0(uint32_t x)
 {
-  uint32_t r7 =
-    opticalROTR32(x, 7);
-
-  uint32_t r18 =
-    opticalROTR32(x, 18);
-
-  uint32_t s3 =
-    opticalSHR32(x, 3);
-
   return opticalXOR32(
-    opticalXOR32(r7, r18),
-    s3
+    opticalXOR32(
+      opticalROTR32(x, 7),
+      opticalROTR32(x, 18)
+    ),
+    opticalSHR32(x, 3)
   );
 }
 
 uint32_t sha256SmallSigma1(uint32_t x)
 {
-  uint32_t r17 =
-    opticalROTR32(x, 17);
-
-  uint32_t r19 =
-    opticalROTR32(x, 19);
-
-  uint32_t s10 =
-    opticalSHR32(x, 10);
-
   return opticalXOR32(
-    opticalXOR32(r17, r19),
-    s10
+    opticalXOR32(
+      opticalROTR32(x, 17),
+      opticalROTR32(x, 19)
+    ),
+    opticalSHR32(x, 10)
   );
 }
 
@@ -1377,7 +1613,8 @@ void sha256Hash(
   uint32_t state[8];
 
   for (uint8_t i = 0; i < 8; i++) {
-    state[i] = SHA256_H0[i];
+    state[i] =
+      SHA256_H0[i];
   }
 
   uint32_t bitLength =
@@ -1403,7 +1640,10 @@ void sha256Hash(
       ((uint32_t)blockIndex) *
       SHA256_BLOCK_SIZE;
 
-    for (uint8_t i = 0; i < SHA256_BLOCK_SIZE; i++) {
+    for (uint8_t i = 0;
+         i < SHA256_BLOCK_SIZE;
+         i++) {
+
       uint32_t absoluteIndex =
         blockStart + i;
 
@@ -1444,16 +1684,16 @@ void sha256Hash(
     }
 
     for (uint8_t t = 16; t < 64; t++) {
-      uint32_t sigma0 =
+      uint32_t s0 =
         sha256SmallSigma0(w[t - 15]);
 
-      uint32_t sigma1 =
+      uint32_t s1 =
         sha256SmallSigma1(w[t - 2]);
 
       uint32_t part1 =
         opticalADD32(
           w[t - 16],
-          sigma0
+          s0
         );
 
       uint32_t part2 =
@@ -1465,7 +1705,7 @@ void sha256Hash(
       w[t] =
         opticalADD32(
           part2,
-          sigma1
+          s1
         );
     }
 
@@ -1479,32 +1719,38 @@ void sha256Hash(
     uint32_t h = state[7];
 
     for (uint8_t t = 0; t < 64; t++) {
-      uint32_t sigma1 =
+      uint32_t s1 =
         sha256BigSigma1(e);
 
-      uint32_t choose =
+      uint32_t ch =
         sha256Ch(e, f, g);
 
       uint32_t temp1 =
-        opticalADD32(h, sigma1);
+        opticalADD32(h, s1);
 
       temp1 =
-        opticalADD32(temp1, choose);
+        opticalADD32(temp1, ch);
 
       temp1 =
-        opticalADD32(temp1, SHA256_K[t]);
+        opticalADD32(
+          temp1,
+          SHA256_K[t]
+        );
 
       temp1 =
-        opticalADD32(temp1, w[t]);
+        opticalADD32(
+          temp1,
+          w[t]
+        );
 
-      uint32_t sigma0 =
+      uint32_t s0 =
         sha256BigSigma0(a);
 
-      uint32_t majority =
+      uint32_t maj =
         sha256Maj(a, b, c);
 
       uint32_t temp2 =
-        opticalADD32(sigma0, majority);
+        opticalADD32(s0, maj);
 
       h = g;
       g = f;
@@ -1559,12 +1805,18 @@ void printSha256Digest(
   const uint8_t digest[SHA256_DIGEST_SIZE]
 )
 {
-  for (uint8_t i = 0; i < SHA256_DIGEST_SIZE; i++) {
+  for (uint8_t i = 0;
+       i < SHA256_DIGEST_SIZE;
+       i++) {
+
     if (digest[i] < 0x10) {
       Serial.print('0');
     }
 
-    Serial.print(digest[i], HEX);
+    Serial.print(
+      digest[i],
+      HEX
+    );
   }
 
   Serial.println();
@@ -1587,7 +1839,9 @@ void sha256Command(const char* message)
 
   opticalEvents = 0;
 
-  Serial.println(F("Computing SHA-256..."));
+  Serial.println(
+    F("Computing SHA-256...")
+  );
 
   Serial.print(F("Input: "));
   Serial.println(message);
@@ -1614,20 +1868,6 @@ void sha256Command(const char* message)
   Serial.println(opticalEvents);
 }
 
-bool sha256CompareDigest(
-  const uint8_t actual[SHA256_DIGEST_SIZE],
-  const uint8_t expected[SHA256_DIGEST_SIZE]
-)
-{
-  for (uint8_t i = 0; i < SHA256_DIGEST_SIZE; i++) {
-    if (actual[i] != expected[i]) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
 void runSha256Test()
 {
   static const char testMessage[] = "abc";
@@ -1649,8 +1889,9 @@ void runSha256Test()
 
   opticalEvents = 0;
 
-  Serial.println(F("SHA-256 known-answer test"));
-  Serial.println(F("Message: abc"));
+  Serial.println(
+    F("SHA-256 known-answer test")
+  );
 
   uint32_t startTime =
     millis();
@@ -1670,11 +1911,17 @@ void runSha256Test()
   Serial.print(F("Expected:   "));
   printSha256Digest(expectedDigest);
 
-  bool passed =
-    sha256CompareDigest(
-      actualDigest,
-      expectedDigest
-    );
+  bool passed = true;
+
+  for (uint8_t i = 0;
+       i < SHA256_DIGEST_SIZE;
+       i++) {
+
+    if (actualDigest[i] != expectedDigest[i]) {
+      passed = false;
+      break;
+    }
+  }
 
   Serial.print(F("Result: "));
   Serial.println(
@@ -1699,14 +1946,14 @@ void runSha256Test()
 
 void calibrateThreshold()
 {
-  valvesOff();
+  turnOffAllValves();
 
   Serial.println(
-    F("Block both operand photodiodes.")
+    F("Block input photodiodes.")
   );
 
   Serial.println(
-    F("Press any key for dark measurement.")
+    F("Press a key for dark measurement.")
   );
 
   while (!Serial.available()) {
@@ -1717,21 +1964,21 @@ void calibrateThreshold()
     Serial.read();
   }
 
-  uint16_t darkA =
-    readPhotodiode(MUX_OPERAND_A);
+  uint16_t dark0 =
+    readPhotodiode(MUX_INPUT_0);
 
-  uint16_t darkB =
-    readPhotodiode(MUX_OPERAND_B);
+  uint16_t dark1 =
+    readPhotodiode(MUX_INPUT_1);
 
-  uint16_t darkR =
+  uint16_t darkResult =
     readPhotodiode(MUX_RESULT);
 
   Serial.println(
-    F("Illuminate both photodiodes.")
+    F("Illuminate input photodiodes.")
   );
 
   Serial.println(
-    F("Press any key for bright measurement.")
+    F("Press a key for bright measurement.")
   );
 
   while (!Serial.available()) {
@@ -1742,20 +1989,20 @@ void calibrateThreshold()
     Serial.read();
   }
 
-  uint16_t brightA =
-    readPhotodiode(MUX_OPERAND_A);
+  uint16_t bright0 =
+    readPhotodiode(MUX_INPUT_0);
 
-  uint16_t brightB =
-    readPhotodiode(MUX_OPERAND_B);
+  uint16_t bright1 =
+    readPhotodiode(MUX_INPUT_1);
 
-  uint16_t brightR =
+  uint16_t brightResult =
     readPhotodiode(MUX_RESULT);
 
   uint16_t darkAverage =
-    (darkA + darkB + darkR) / 3;
+    (dark0 + dark1 + darkResult) / 3;
 
   uint16_t brightAverage =
-    (brightA + brightB + brightR) / 3;
+    (bright0 + bright1 + brightResult) / 3;
 
   if (brightAverage >= darkAverage) {
     photodiodeThreshold =
@@ -1779,7 +2026,7 @@ void calibrateThreshold()
 
 void automaticAmbientCalibration()
 {
-  valvesOff();
+  turnOffAllValves();
 
   ambientLevel =
     readPhotodiode(MUX_AMBIENT);
@@ -1798,7 +2045,7 @@ void automaticAmbientCalibration()
 
 
 // ============================================================
-// Tests
+// Self-tests
 // ============================================================
 
 bool testBitOperation(
@@ -1919,64 +2166,11 @@ void runSelfTest()
     );
   }
 
-  Serial.println(
-    F("Testing half-adders...")
-  );
+  const uint32_t a =
+    0x12345678UL;
 
-  for (uint8_t i = 0; i < 4; i++) {
-    bool a = values[i][0];
-    bool b = values[i][1];
-
-    HalfAdderResult result =
-      opticalHalfAdder(a, b);
-
-    testBitOperation(
-      "HALFADD SUM",
-      result.sum,
-      a ^ b
-    );
-
-    testBitOperation(
-      "HALFADD CARRY",
-      result.carry,
-      a && b
-    );
-  }
-
-  Serial.println(
-    F("Testing full-adders...")
-  );
-
-  for (uint8_t a = 0; a <= 1; a++) {
-    for (uint8_t b = 0; b <= 1; b++) {
-      for (uint8_t carry = 0; carry <= 1; carry++) {
-        FullAdderResult result =
-          opticalFullAdder(
-            a,
-            b,
-            carry
-          );
-
-        uint8_t expected =
-          a + b + carry;
-
-        testBitOperation(
-          "FULLADD SUM",
-          result.sum,
-          expected & 1
-        );
-
-        testBitOperation(
-          "FULLADD CARRY",
-          result.carry,
-          expected > 1
-        );
-      }
-    }
-  }
-
-  const uint32_t a = 0x12345678UL;
-  const uint32_t b = 0x87654321UL;
+  const uint32_t b =
+    0x87654321UL;
 
   Serial.println(
     F("Testing 32-bit operations...")
@@ -1998,36 +2192,6 @@ void runSelfTest()
     "XOR32",
     opticalXOR32(a, b),
     a ^ b
-  );
-
-  testWordOperation(
-    "NAND32",
-    opticalNAND32(a, b),
-    ~(a & b)
-  );
-
-  testWordOperation(
-    "NOR32",
-    opticalNOR32(a, b),
-    ~(a | b)
-  );
-
-  testWordOperation(
-    "XNOR32",
-    opticalXNOR32(a, b),
-    ~(a ^ b)
-  );
-
-  testWordOperation(
-    "IMPLIES32",
-    opticalIMPLIES32(a, b),
-    (~a) | b
-  );
-
-  testWordOperation(
-    "NIMPLY32",
-    opticalNIMPLY32(a, b),
-    a & (~b)
   );
 
   testWordOperation(
@@ -2054,8 +2218,9 @@ void runSelfTest()
     (a >> 7) | (a << 25)
   );
 
-  Serial.println();
-  Serial.println(F("Self-test complete."));
+  Serial.println(
+    F("Self-test complete.")
+  );
 
   Serial.print(F("Errors="));
   Serial.println(errorCount);
@@ -2122,78 +2287,84 @@ void printStatus()
 {
   printSeparator();
 
-  Serial.println(F("OPTICAL UNO STATUS"));
-
-  Serial.print(F("Operation: "));
-  Serial.println(currentOperationName);
-
-  Serial.print(F("Operation amount: "));
-  Serial.println(operationAmount);
-
-  Serial.print(F("Threshold: "));
-  Serial.println(photodiodeThreshold);
-
-  Serial.print(F("Hysteresis: "));
-  Serial.println(photodiodeHysteresis);
-
-  Serial.print(F("Samples: "));
-  Serial.println(sampleCount);
-
-  Serial.print(F("Valve A level: "));
-  Serial.println(valveALevel);
-
-  Serial.print(F("Valve B level: "));
-  Serial.println(valveBLevel);
-
-  Serial.print(F("Valves enabled: "));
   Serial.println(
-    valvesEnabled ? F("yes") : F("no")
+    F("DYNAMIC OPTICAL VALVE STATUS")
   );
 
-  Serial.print(F("A level: "));
-  Serial.print(operandALevel);
-  Serial.print(F(" bit="));
-  printBit(operandABit);
-  Serial.println();
+  Serial.print(F("Operation="));
+  Serial.println(currentOperationName);
 
-  Serial.print(F("B level: "));
-  Serial.print(operandBLevel);
-  Serial.print(F(" bit="));
-  printBit(operandBBit);
-  Serial.println();
+  Serial.print(F("Amount="));
+  Serial.println(operationAmount);
 
-  Serial.print(F("Result level: "));
+  Serial.print(F("Threshold="));
+  Serial.println(photodiodeThreshold);
+
+  Serial.print(F("Hysteresis="));
+  Serial.println(photodiodeHysteresis);
+
+  Serial.print(F("Samples="));
+  Serial.println(sampleCount);
+
+  Serial.print(F("Valves enabled="));
+  Serial.println(
+    valvesEnabled
+    ? F("yes")
+    : F("no")
+  );
+
+  printValveConfiguration();
+
+  for (uint8_t index = 0;
+       index < MAX_INPUT_CHANNELS;
+       index++) {
+
+    Serial.print(F("Input["));
+    Serial.print(index);
+
+    Serial.print(F("] level="));
+    Serial.print(inputLevels[index]);
+
+    Serial.print(F(" bit="));
+    printBit(inputBits[index]);
+
+    Serial.println();
+  }
+
+  Serial.print(F("Result level="));
   Serial.print(resultLevel);
+
   Serial.print(F(" bit="));
   printBit(resultBit);
+
   Serial.println();
 
-  Serial.print(F("Ambient: "));
+  Serial.print(F("Ambient="));
   Serial.println(ambientLevel);
 
-  Serial.print(F("Register A: "));
+  Serial.print(F("Register A="));
   printHex32(registerA);
   Serial.println();
 
-  Serial.print(F("Register B: "));
+  Serial.print(F("Register B="));
   printHex32(registerB);
   Serial.println();
 
-  Serial.print(F("Register result: "));
+  Serial.print(F("Register result="));
   printHex32(registerResult);
   Serial.println();
 
-  Serial.print(F("Carry: "));
+  Serial.print(F("Carry="));
   printHex32(registerCarry);
   Serial.println();
 
-  Serial.print(F("Optical events: "));
+  Serial.print(F("Optical events="));
   Serial.println(opticalEvents);
 
-  Serial.print(F("Operations: "));
+  Serial.print(F("Operations="));
   Serial.println(operationCount);
 
-  Serial.print(F("Errors: "));
+  Serial.print(F("Errors="));
   Serial.println(errorCount);
 
   printSeparator();
@@ -2203,9 +2374,8 @@ void printHelp()
 {
   printSeparator();
 
-  Serial.println(F("COMMANDS"));
+  Serial.println(F("HELP"));
 
-  Serial.println(F("help"));
   Serial.println(F("status"));
   Serial.println(F("read"));
   Serial.println(F("calibrate"));
@@ -2213,6 +2383,15 @@ void printHelp()
   Serial.println(F("threshold 500"));
   Serial.println(F("hysteresis 20"));
   Serial.println(F("samples 8"));
+
+  Serial.println(F("valves"));
+  Serial.println(F("valvecount 2"));
+  Serial.println(F("valvepin 0 3"));
+  Serial.println(F("valvepin 1 5"));
+  Serial.println(F("valvelevel 0 255"));
+  Serial.println(F("valve 0 1"));
+  Serial.println(F("valve 0 255"));
+  Serial.println(F("stop"));
 
   Serial.println(F("operation AND"));
   Serial.println(F("operation OR"));
@@ -2232,11 +2411,6 @@ void printHelp()
   Serial.println(F("rega 0x12345678"));
   Serial.println(F("regb 0x87654321"));
   Serial.println(F("execute"));
-
-  Serial.println(F("valvea 255"));
-  Serial.println(F("valveb 255"));
-  Serial.println(F("valves 255 128"));
-  Serial.println(F("stop"));
 
   Serial.println(F("test"));
   Serial.println(F("sha256"));
@@ -2295,45 +2469,54 @@ void processCommand(char* command)
   }
 
   if (strcmp(first, "THRESHOLD") == 0) {
-    char* value = nextToken(cursor);
+    char* value =
+      nextToken(cursor);
 
-    if (value == nullptr) {
-      Serial.print(F("Threshold="));
-      Serial.println(photodiodeThreshold);
-    } else {
+    if (value != nullptr) {
       photodiodeThreshold =
-        constrain(parseNumber(value), 0, 1023);
-
-      Serial.print(F("Threshold="));
-      Serial.println(photodiodeThreshold);
+        constrain(
+          parseNumber(value),
+          0,
+          1023
+        );
     }
+
+    Serial.print(F("Threshold="));
+    Serial.println(photodiodeThreshold);
 
     return;
   }
 
   if (strcmp(first, "HYSTERESIS") == 0) {
-    char* value = nextToken(cursor);
+    char* value =
+      nextToken(cursor);
 
-    if (value == nullptr) {
-      Serial.print(F("Hysteresis="));
-      Serial.println(photodiodeHysteresis);
-    } else {
+    if (value != nullptr) {
       photodiodeHysteresis =
-        constrain(parseNumber(value), 0, 500);
-
-      Serial.print(F("Hysteresis="));
-      Serial.println(photodiodeHysteresis);
+        constrain(
+          parseNumber(value),
+          0,
+          500
+        );
     }
+
+    Serial.print(F("Hysteresis="));
+    Serial.println(photodiodeHysteresis);
 
     return;
   }
 
   if (strcmp(first, "SAMPLES") == 0) {
-    char* value = nextToken(cursor);
+    char* value =
+      nextToken(cursor);
 
     if (value != nullptr) {
       sampleCount =
-        constrain(parseNumber(value), 1, 32);
+        constrain(
+          parseNumber(value),
+          1,
+          32
+        );
     }
 
     Serial.print(F("Samples="));
@@ -2342,8 +2525,209 @@ void processCommand(char* command)
     return;
   }
 
+  if (strcmp(first, "VALVES") == 0) {
+    printValveConfiguration();
+    return;
+  }
+
+  if (strcmp(first, "VALVECOUNT") == 0) {
+    char* countText =
+      nextToken(cursor);
+
+    if (countText == nullptr) {
+      Serial.print(F("Valve count="));
+      Serial.println(activeValveCount);
+      return;
+    }
+
+    uint8_t count =
+      parseNumber(countText);
+
+    if (!configureValveCount(count)) {
+      Serial.println(
+        F("Invalid valve count or pin table.")
+      );
+    } else {
+      Serial.print(F("Valve count="));
+      Serial.println(activeValveCount);
+    }
+
+    return;
+  }
+
+  if (strcmp(first, "VALVEPIN") == 0) {
+    char* indexText =
+      nextToken(cursor);
+
+    char* pinText =
+      nextToken(cursor);
+
+    if (indexText == nullptr ||
+        pinText == nullptr) {
+
+      Serial.println(
+        F("Usage: valvepin <index> <pin>")
+      );
+
+      return;
+    }
+
+    uint8_t index =
+      parseNumber(indexText);
+
+    uint8_t pin =
+      parseNumber(pinText);
+
+    if (!configureValvePin(index, pin)) {
+      Serial.println(
+        F("Invalid index, duplicate pin, or non-PWM pin.")
+      );
+
+      return;
+    }
+
+    Serial.print(F("Valve["));
+    Serial.print(index);
+
+    Serial.print(F("] pin="));
+    Serial.println(pin);
+
+    return;
+  }
+
+  if (strcmp(first, "VALVELEVEL") == 0) {
+    char* indexText =
+      nextToken(cursor);
+
+    char* levelText =
+      nextToken(cursor);
+
+    if (indexText == nullptr ||
+        levelText == nullptr) {
+
+      Serial.println(
+        F("Usage: valvelevel <index> <level>")
+      );
+
+      return;
+    }
+
+    uint8_t index =
+      parseNumber(indexText);
+
+    uint8_t level =
+      constrain(
+        parseNumber(levelText),
+        0,
+        255
+      );
+
+    if (!validValveIndex(index)) {
+      Serial.println(
+        F("Invalid valve index.")
+      );
+
+      return;
+    }
+
+    setValveLevel(
+      index,
+      level
+    );
+
+    updateValveEnable();
+
+    Serial.print(F("Valve["));
+    Serial.print(index);
+
+    Serial.print(F("] level="));
+    Serial.println(level);
+
+    return;
+  }
+
+  if (strcmp(first, "VALVE") == 0) {
+    char* indexText =
+      nextToken(cursor);
+
+    char* valueText =
+      nextToken(cursor);
+
+    if (indexText == nullptr) {
+      Serial.println(
+        F("Usage: valve <index> <0|1|level>")
+      );
+
+      return;
+    }
+
+    uint8_t index =
+      parseNumber(indexText);
+
+    if (!validValveIndex(index)) {
+      Serial.println(
+        F("Invalid valve index.")
+      );
+
+      return;
+    }
+
+    if (valueText == nullptr) {
+      Serial.print(F("Valve["));
+      Serial.print(index);
+
+      Serial.print(F("] level="));
+      Serial.println(valveLevels[index]);
+
+      return;
+    }
+
+    uint16_t value =
+      parseNumber(valueText);
+
+    if (value <= 1) {
+      setValveState(
+        index,
+        value != 0
+      );
+    } else {
+      setValveLevel(
+        index,
+        constrain(value, 0, 255)
+      );
+    }
+
+    updateValveEnable();
+
+    Serial.print(F("Valve["));
+    Serial.print(index);
+
+    Serial.print(F("] level="));
+    Serial.print(valveLevels[index]);
+
+    Serial.print(F(" state="));
+    Serial.println(
+      valveStates[index]
+      ? F("on")
+      : F("off")
+    );
+
+    return;
+  }
+
+  if (strcmp(first, "STOP") == 0) {
+    turnOffAllValves();
+
+    Serial.println(
+      F("All valves stopped.")
+    );
+
+    return;
+  }
+
   if (strcmp(first, "OPERATION") == 0) {
-    char* operation = nextToken(cursor);
+    char* operation =
+      nextToken(cursor);
 
     if (operation == nullptr) {
       Serial.print(F("Operation="));
@@ -2354,15 +2738,23 @@ void processCommand(char* command)
     uppercaseInPlace(operation);
 
     if (!setOperationByName(operation)) {
-      Serial.println(F("Unknown operation."));
+      Serial.println(
+        F("Unknown operation.")
+      );
+
       return;
     }
 
-    char* amount = nextToken(cursor);
+    char* amount =
+      nextToken(cursor);
 
     if (amount != nullptr) {
       operationAmount =
-        constrain(parseNumber(amount), 0, 31);
+        constrain(
+          parseNumber(amount),
+          0,
+          31
+        );
     } else {
       operationAmount = 0;
     }
@@ -2377,7 +2769,8 @@ void processCommand(char* command)
   }
 
   if (strcmp(first, "REGA") == 0) {
-    char* value = nextToken(cursor);
+    char* value =
+      nextToken(cursor);
 
     if (value != nullptr) {
       registerA =
@@ -2392,7 +2785,8 @@ void processCommand(char* command)
   }
 
   if (strcmp(first, "REGB") == 0) {
-    char* value = nextToken(cursor);
+    char* value =
+      nextToken(cursor);
 
     if (value != nullptr) {
       registerB =
@@ -2429,79 +2823,6 @@ void processCommand(char* command)
     return;
   }
 
-  if (strcmp(first, "VALVEA") == 0) {
-    char* value =
-      nextToken(cursor);
-
-    if (value != nullptr) {
-      setValveA(
-        constrain(parseNumber(value), 0, 255)
-      );
-
-      valvesEnable();
-    }
-
-    Serial.print(F("Valve A="));
-    Serial.println(valveALevel);
-
-    return;
-  }
-
-  if (strcmp(first, "VALVEB") == 0) {
-    char* value =
-      nextToken(cursor);
-
-    if (value != nullptr) {
-      setValveB(
-        constrain(parseNumber(value), 0, 255)
-      );
-
-      valvesEnable();
-    }
-
-    Serial.print(F("Valve B="));
-    Serial.println(valveBLevel);
-
-    return;
-  }
-
-  if (strcmp(first, "VALVES") == 0) {
-    char* valueA =
-      nextToken(cursor);
-
-    char* valueB =
-      nextToken(cursor);
-
-    if (valueA != nullptr) {
-      valveALevel =
-        constrain(parseNumber(valueA), 0, 255);
-    }
-
-    if (valueB != nullptr) {
-      valveBLevel =
-        constrain(parseNumber(valueB), 0, 255);
-    }
-
-    setBothValves(
-      valveALevel,
-      valveBLevel
-    );
-
-    Serial.print(F("Valve A="));
-    Serial.print(valveALevel);
-
-    Serial.print(F(" Valve B="));
-    Serial.println(valveBLevel);
-
-    return;
-  }
-
-  if (strcmp(first, "STOP") == 0) {
-    valvesOff();
-    Serial.println(F("Valves stopped."));
-    return;
-  }
-
   if (strcmp(first, "TRACE") == 0) {
     char* value =
       nextToken(cursor);
@@ -2515,7 +2836,9 @@ void processCommand(char* command)
 
     Serial.print(F("Trace="));
     Serial.println(
-      traceEnabled ? F("on") : F("off")
+      traceEnabled
+      ? F("on")
+      : F("off")
     );
 
     return;
@@ -2534,7 +2857,9 @@ void processCommand(char* command)
 
     Serial.print(F("Stream="));
     Serial.println(
-      streamEnabled ? F("on") : F("off")
+      streamEnabled
+      ? F("on")
+      : F("off")
     );
 
     return;
@@ -2572,6 +2897,7 @@ void readSerialCommands()
 
     if (commandLength <
         COMMAND_BUFFER_SIZE - 1) {
+
       commandBuffer[commandLength++] =
         incoming;
     }
@@ -2580,7 +2906,7 @@ void readSerialCommands()
 
 
 // ============================================================
-// Stream mode
+// Streaming
 // ============================================================
 
 void streamOpticalState()
@@ -2602,32 +2928,28 @@ void streamOpticalState()
   Serial.print(F("STREAM,"));
   Serial.print(millis());
 
-  Serial.print(',');
-  Serial.print(operandALevel);
+  for (uint8_t index = 0;
+       index < MAX_INPUT_CHANNELS;
+       index++) {
 
-  Serial.print(',');
-  Serial.print(operandBLevel);
+    Serial.print(',');
+    Serial.print(inputLevels[index]);
+
+    Serial.print(',');
+    printBit(inputBits[index]);
+  }
 
   Serial.print(',');
   Serial.print(resultLevel);
 
   Serial.print(',');
-  Serial.print(ambientLevel);
-
-  Serial.print(',');
-  printBit(operandABit);
-
-  Serial.print(',');
-  printBit(operandBBit);
-
-  Serial.print(',');
   printBit(resultBit);
 
   Serial.print(',');
-  Serial.print(valveALevel);
+  Serial.print(ambientLevel);
 
   Serial.print(',');
-  Serial.println(valveBLevel);
+  Serial.println(activeValveCount);
 }
 
 
@@ -2642,13 +2964,12 @@ void setup()
   pinMode(MUX_S2, OUTPUT);
   pinMode(MUX_ENABLE, OUTPUT);
 
-  pinMode(VALVE_A_PWM_PIN, OUTPUT);
-  pinMode(VALVE_B_PWM_PIN, OUTPUT);
-  pinMode(VALVES_ENABLE_PIN, OUTPUT);
+  digitalWrite(
+    MUX_ENABLE,
+    LOW
+  );
 
-  digitalWrite(MUX_ENABLE, LOW);
-
-  valvesOff();
+  initializeValveSystems();
 
   Serial.begin(115200);
 
@@ -2656,11 +2977,11 @@ void setup()
 
   Serial.println();
   Serial.println(
-    F("Arduino Uno Two-Valve Optical Processor")
+    F("Arduino Uno Dynamic Optical Processor")
   );
 
   Serial.println(
-    F("D5=Valve A PWM, D6=Valve B PWM, D4=enable")
+    F("Runtime valve count and pin mapping enabled")
   );
 
   Serial.println(
