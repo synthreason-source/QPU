@@ -6,7 +6,7 @@
  * simulated or analog optical sensor readings.
  */
 
-#const int SENSOR_PIN = A0;  // Analog pin connected to the optical sensor/photodiode
+const int SENSOR_PIN = A0;  // Analog pin connected to the optical sensor/photodiode
 const long BAUD_RATE = 115200;
 
 void setup() {
