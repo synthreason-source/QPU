@@ -2442,7 +2442,6 @@ void printHelp()
   Serial.println(F("mode optical"));
   Serial.println(F("mode software"));
 
-  Serial.println(F("VALVES"));
   Serial.println(F("valves"));
   Serial.println(F("valvecount 2"));
   Serial.println(F("valvepin 0 3"));
