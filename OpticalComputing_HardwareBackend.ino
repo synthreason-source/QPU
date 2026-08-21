@@ -3,79 +3,94 @@
  * ===================================
  * Arduino firmware companion for optical_binary.py.
  *
- * Drives an arbitrary number of light valves by daisy-chaining
- * 74HC595 (or compatible) shift registers: each additional register
- * adds 8 more valve outputs, chained off the same 3 control pins
- * (DATA / CLOCK / LATCH). Valve count is therefore limited only by
- * how many registers you physically chain -- not by GPIO count.
+ * Drives each light valve from its own Arduino digital output pin
+ * (no shift registers). Simple and direct, but the valve count is
+ * now hard-capped at however many GPIO pins you list in VALVE_PINS[]
+ * -- typically ~10-20 on an Uno/Nano/Mega depending on what else you
+ * need. If you outgrow your available pins, you'd need to go back to
+ * a shift-register chain (or an I/O expander) instead.
+ *
+ * Valve state convention: bit = 1 -> valve OPEN, bit = 0 -> valve
+ * CLOSED. Invert here (or in your driver stage) if yours is active-low.
  *
  * Framing protocol (must match optical_binary.py):
  *   Host -> MCU:  "FRAME:<N>\n"   ASCII header, N = number of payload bytes
  *                 <N raw bytes>    packed bit data, MSB-first per byte
- *   MCU  -> Host: "ACK\n"          once every byte is shifted out and latched
+ *   MCU  -> Host: "ACK\n"          once every valve pin has been set
  *
- * The header is read as a text line (safe, since it's pure ASCII and
- * always ends in exactly one '\n'). The payload that follows is read
- * as a fixed number of raw bytes, NOT scanned for '\n' -- so binary
- * data can contain any byte value, including 0x0A, without breaking
- * framing. Each payload byte is shifted straight into the register
- * chain as it arrives (no full-frame buffering), so the number of
- * valves you can address isn't capped by the MCU's RAM either.
+ * The header is read as a text line (safe -- pure ASCII, always ends
+ * in exactly one '\n'). The payload that follows is read as a fixed
+ * byte count, NOT scanned for '\n', so binary data can contain any
+ * byte value without breaking framing.
+ *
+ * Only the first NUM_VALVES bits of the incoming payload are applied
+ * (one bit per pin, MSB-first per byte, in VALVE_PINS[] order). Any
+ * extra bits beyond NUM_VALVES are still read off the wire (to stay
+ * in sync with the host) but ignored.
  */
 
-const int DATA_PIN  = 11; // to 74HC595 pin 14 (DS)
-const int CLOCK_PIN = 12; // to 74HC595 pin 11 (SHCP)
-const int LATCH_PIN = 10; // to 74HC595 pin 12 (STCP)
+// --- One pin per valve. Edit this list to match your wiring. ---
+const int VALVE_PINS[] = {2, 3, 4, 5, 6, 7, 8, 9};
+const int NUM_VALVES = sizeof(VALVE_PINS) / sizeof(VALVE_PINS[0]);
+const int NUM_PAYLOAD_BYTES = (NUM_VALVES + 7) / 8; // ceil(NUM_VALVES / 8)
 
 const int SENSOR_PIN = A0;  // Analog pin connected to the optical sensor/photodiode
 const long BAUD_RATE = 115200;
 
 const unsigned long BYTE_TIMEOUT_MS = 2000; // per-byte read timeout while receiving a frame
 
+// Small fixed buffer, bounded by NUM_VALVES (not by frame size), so
+// we can apply all valve pins together for an atomic-looking update.
+uint8_t frameBuffer[(NUM_VALVES + 7) / 8];
+
 void setup() {
   Serial.begin(BAUD_RATE);
   Serial.setTimeout(BYTE_TIMEOUT_MS);
   while (!Serial); // Wait for serial port to connect (native USB boards)
 
-  pinMode(DATA_PIN, OUTPUT);
-  pinMode(CLOCK_PIN, OUTPUT);
-  pinMode(LATCH_PIN, OUTPUT);
   pinMode(SENSOR_PIN, INPUT);
 
-  digitalWrite(LATCH_PIN, LOW);
+  // Every valve starts CLOSED -- known, safe state before anything
+  // else happens.
+  for (int i = 0; i < NUM_VALVES; i++) {
+    pinMode(VALVE_PINS[i], OUTPUT);
+    digitalWrite(VALVE_PINS[i], LOW);
+  }
 }
 
-// Reads exactly `count` raw bytes one at a time, shifting each one
-// into the register chain as soon as it arrives (no full-frame
-// buffer, so this scales past the MCU's available RAM).
+// Reads exactly `count` raw bytes off the wire. The first
+// NUM_PAYLOAD_BYTES of them are kept in frameBuffer; anything beyond
+// that is still read (to stay in sync with the host) but discarded.
 // Returns true on success, false on timeout/short read.
-bool streamFrameIntoShiftRegisters(long count) {
+bool receiveFrame(long count) {
   for (long i = 0; i < count; i++) {
+    unsigned long waitStart = millis();
     while (Serial.available() == 0) {
-      // Bail out if the host stalls mid-frame
-      static unsigned long waitStart = 0;
-      if (waitStart == 0) waitStart = millis();
       if (millis() - waitStart > BYTE_TIMEOUT_MS) {
-        waitStart = 0;
         return false;
       }
     }
     int b = Serial.read();
     if (b < 0) return false;
 
-    // Shift this byte through the whole daisy-chain. Nothing is
-    // latched (i.e. nothing physically changes on the valves) until
-    // every byte has been shifted in and latchAll() is called --
-    // this keeps the exposure atomic across the whole matrix.
-    shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, (uint8_t)b);
+    if (i < NUM_PAYLOAD_BYTES) {
+      frameBuffer[i] = (uint8_t)b;
+    }
+    // else: extra byte beyond what we can use -- drained, not stored
   }
   return true;
 }
 
-void latchAll() {
-  digitalWrite(LATCH_PIN, LOW);
-  digitalWrite(LATCH_PIN, HIGH);
-  digitalWrite(LATCH_PIN, LOW);
+// Applies frameBuffer to the actual valve pins: one bit per valve,
+// MSB-first per byte, in VALVE_PINS[] order. This is the moment the
+// physical valves change state.
+void applyValvesFromBuffer() {
+  for (int v = 0; v < NUM_VALVES; v++) {
+    int byteIdx = v / 8;
+    int bitIdx  = 7 - (v % 8); // MSB-first, matches np.packbits(bitorder="big")
+    bool open = (frameBuffer[byteIdx] >> bitIdx) & 0x01;
+    digitalWrite(VALVE_PINS[v], open ? HIGH : LOW);
+  }
 }
 
 void loop() {
@@ -93,11 +108,11 @@ void loop() {
       if (payloadLen <= 0) {
         Serial.println("ERR:BAD_LENGTH");
       } else {
-        bool ok = streamFrameIntoShiftRegisters(payloadLen);
+        bool ok = receiveFrame(payloadLen);
         if (!ok) {
           Serial.println("ERR:TIMEOUT");
         } else {
-          latchAll(); // apply the whole matrix to the valves atomically
+          applyValvesFromBuffer(); // this is the actual valve actuation moment
           Serial.println("ACK");
         }
       }
