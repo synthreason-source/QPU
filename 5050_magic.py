@@ -6,6 +6,12 @@ Real optical bench + ITO spatial modulator + streamed temporal bins.
 Compares camera-derived optical arrival proxies after an unblock command
 for deterministic and random instruction schedules.
 
+Predictor
+---------
+Uses a *non-arbitrary* predictor that conditions on observed trial features
+(event count, delay statistics, intensities, ITO activity) to guess
+"deterministic" or "random". Confidence is derived from the classifier score.
+
 Important measurement note
 --------------------------
 A normal USB/CMOS camera does not time-tag individual photons. This program
@@ -306,6 +312,130 @@ class RealOpticalArrivalComparison:
 
 
 # ==============================================================
+# NON-ARBITRARY PREDICTOR
+# ==============================================================
+
+@dataclass
+class TrialSummary:
+    schedule: str
+    trial: int
+    event_count: int
+    mean_delay_ns: float
+    std_delay_ns: float
+    mean_intensity: float
+    active_ito_cells: int
+    total_mode_intensity: float
+
+
+def summarize_trials(events: Sequence[ArrivalEvent], frame_records) -> list[TrialSummary]:
+    by_trial = {}
+    for e in events:
+        key = (e.schedule, e.trial)
+        if key not in by_trial:
+            by_trial[key] = []
+        by_trial[key].append(e)
+
+    frame_by_trial = {}
+    for rec in frame_records:
+        sched, trial, t, cmd_ns, frame_ns, total_int, active_cells = rec
+        key = (sched, trial)
+        if key not in frame_by_trial:
+            frame_by_trial[key] = []
+        frame_by_trial[key].append((t, total_int, active_cells))
+
+    summaries = []
+    for (schedule, trial), evs in by_trial.items():
+        delays = np.asarray([ev.delay_after_unblock_ns for ev in evs], dtype=np.float64)
+        intensities = np.asarray([ev.intensity for ev in evs], dtype=np.float64)
+        frames = frame_by_trial.get((schedule, trial), [])
+        total_int = sum(f[1] for f in frames)
+        active_cells = sum(f[2] for f in frames)
+        summaries.append(TrialSummary(
+            schedule=schedule,
+            trial=trial,
+            event_count=int(delays.size),
+            mean_delay_ns=float(delays.mean()) if delays.size else 0.0,
+            std_delay_ns=float(delays.std()) if delays.size else 0.0,
+            mean_intensity=float(intensities.mean()) if intensities.size else 0.0,
+            active_ito_cells=active_cells,
+            total_mode_intensity=total_int,
+        ))
+    return summaries
+
+
+def predict_non_arbitrary(summaries: list[TrialSummary], rng: np.random.Generator) -> list[tuple[TrialSummary, str, float]]:
+    """
+    Non-arbitrary predictor:
+
+    For each trial summary s, compute a score that tends to be higher for
+    deterministic-like patterns and lower for random-like patterns, then
+    map that score through a sigmoid to get P(deterministic).
+
+    Heuristic features (can be tuned):
+      - event_count: deterministic schedules often have more stable counts
+      - std_delay_ns / mean_delay_ns: random schedules may show higher relative variance
+      - active_ito_cells / total_mode_intensity: pattern structure differences
+
+    This is intentionally simple and not trained; it just illustrates a
+    data-dependent predictor.
+    """
+    results = []
+
+    # Collect global stats for normalization
+    if len(summaries) == 0:
+        return results
+
+    event_counts = np.array([s.event_count for s in summaries], dtype=np.float64)
+    mean_delays = np.array([s.mean_delay_ns for s in summaries], dtype=np.float64)
+    std_delays = np.array([s.std_delay_ns for s in summaries], dtype=np.float64)
+    mean_intensities = np.array([s.mean_intensity for s in summaries], dtype=np.float64)
+    active_cells = np.array([s.active_ito_cells for s in summaries], dtype=np.float64)
+    total_intensities = np.array([s.total_mode_intensity for s in summaries], dtype=np.float64)
+
+    # Avoid division by zero
+    mean_delays_safe = np.where(mean_delays > 0, mean_delays, 1.0)
+    rel_std = std_delays / mean_delays_safe
+
+    # Normalize features roughly to [0,1] ranges using robust scaling
+    def robust_scale(x):
+        med = np.median(x)
+        q1, q3 = np.percentile(x, [25, 75])
+        iqr = q3 - q1
+        if iqr == 0:
+            iqr = 1.0
+        z = (x - med) / iqr
+        # squash to ~[0,1] via sigmoid-like mapping
+        return 1.0 / (1.0 + np.exp(-z))
+
+    f_count = robust_scale(event_counts)
+    f_relstd = robust_scale(-rel_std)  # lower rel_std -> more deterministic-like
+    f_intensity = robust_scale(mean_intensities)
+    f_activity = robust_scale(active_cells / np.where(total_intensities > 0, total_intensities, 1.0))
+
+    # Simple linear combination
+    # Positive weights for count, intensity, activity; negative for relative std
+    score = (
+        1.0 * f_count
+        + 1.5 * f_relstd
+        + 0.5 * f_intensity
+        + 0.5 * f_activity
+    )
+
+    # Map score to probability via sigmoid with adjustable center/slope
+    center = 2.0
+    slope = 2.0
+    p_det = 1.0 / (1.0 + np.exp(-slope * (score - center)))
+
+    for s, pd in zip(summaries, p_det):
+        # Randomized decision based on p_det
+        label = "deterministic" if rng.random() < pd else "random"
+        conf = float(max(pd, 1.0 - pd))
+        results.append((s, label, conf))
+
+    return results
+
+
+# ==============================================================
 # REPORTING
 # ==============================================================
 
@@ -345,8 +475,24 @@ def write_frames(path: Path, records):
         w.writerows(records)
 
 
+def write_predictions(path: Path, predictions: list[tuple[TrialSummary, str, float]]):
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "schedule", "trial", "event_count", "mean_delay_ns", "std_delay_ns",
+            "mean_intensity", "active_ito_cells", "total_mode_intensity",
+            "predicted_label", "confidence",
+        ])
+        for s, label, conf in predictions:
+            w.writerow([
+                s.schedule, s.trial, s.event_count, s.mean_delay_ns, s.std_delay_ns,
+                s.mean_intensity, s.active_ito_cells, s.total_mode_intensity,
+                label, conf,
+            ])
+
+
 def main():
-    p = argparse.ArgumentParser(description="Real optical-bench arrival-proxy comparison after ITO unblocking.")
+    p = argparse.ArgumentParser(description="Real optical-bench arrival-proxy comparison after ITO unblocking with non-arbitrary predictor.")
     p.add_argument("--synthetic", action="store_true", help="Use synthetic frames instead of a physical camera.")
     p.add_argument("--synthetic-seed", type=int, default=2026)
     p.add_argument("--synthetic-noise", type=float, default=0.03)
@@ -421,12 +567,23 @@ def main():
         print(f"deterministic: events={sd['count']}, mean={sd['mean_ns']}, std={sd['std_ns']}, min={sd['min_ns']}, max={sd['max_ns']}")
         print(f"random       : events={sr['count']}, mean={sr['mean_ns']}, std={sr['std_ns']}, min={sr['min_ns']}, max={sr['max_ns']}")
 
+        # Summarize per-trial
+        all_frames = deterministic_frames + random_frames
+        all_events = deterministic_events + random_events
+        summaries = summarize_trials(all_events, all_frames)
+
+        # Non-arbitrary predictions
+        pred_rng = np.random.default_rng(args.seed + 999)
+        predictions = predict_non_arbitrary(summaries, pred_rng)
+
         out = Path(args.output)
         out.mkdir(parents=True, exist_ok=True)
         write_events(out / "deterministic_arrival_events.csv", deterministic_events)
         write_events(out / "random_arrival_events.csv", random_events)
         write_frames(out / "deterministic_frame_records.csv", deterministic_frames)
         write_frames(out / "random_frame_records.csv", random_frames)
+        write_predictions(out / "trial_predictions_non_arbitrary.csv", predictions)
+
         metadata = {
             "camera_mode": camera_name,
             "serial_port": args.serial,
@@ -442,9 +599,12 @@ def main():
             "deterministic_stats": sd,
             "random_stats": sr,
             "measurement_note": "Camera frame timing and threshold crossings are arrival proxies, not single-photon time tags.",
+            "predictor_note": "Non-arbitrary predictor uses event counts, delay variance, intensities, and ITO activity to estimate P(deterministic).",
         }
         (out / "metadata.txt").write_text("\n".join(f"{k} = {v}" for k, v in metadata.items()), encoding="utf-8")
+
         print(f"\nSaved results to: {out}")
+        print("Non-arbitrary predictions written to: trial_predictions_non_arbitrary.csv")
     finally:
         camera.close()
         ito.close()
