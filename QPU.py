@@ -70,7 +70,7 @@ EXAMPLE
 
 with:
 
-    --modes_z 64
+    --modes-z 64
 
 gives:
 
@@ -81,7 +81,7 @@ without allocating a 65,536-element optical field.
 
 For:
 
-    --modes_z 1024
+    --modes-z 1024
 
 you get:
 
@@ -1637,7 +1637,7 @@ def main():
 
     if args.modes_z <= 0:
         raise ValueError(
-            "--modes_z must be > 0"
+            "--modes-z must be > 0"
         )
 
     spatial_modes = (
@@ -1736,7 +1736,7 @@ def main():
         )
 
         print(
-            f"Temporal modes (--modes_z): "
+            f"Temporal modes (--modes-z): "
             f"{args.modes_z:,}"
         )
 
