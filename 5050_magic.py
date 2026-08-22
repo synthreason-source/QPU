@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-continuum_optical_bench_arrival.py
+continuum_optical_bench_arrival_live.py
 
 Real/synthetic optical bench + ITO spatial modulator + streamed temporal bins.
 Compares photon arrival proxies after unblocking under:
@@ -8,21 +8,22 @@ Compares photon arrival proxies after unblocking under:
   - randomly sampled futures
 driven by an existent instruction pressure.
 
-Continuum rule (updated)
-------------------------
+Continuum rule
+--------------
 Trials are run sequentially in a continuum with a finite instruction budget.
 For each trial:
   - A predictor guesses "deterministic" vs "random" from the data.
   - If the prediction is correct:
-      * The continuum lengthens (more trials become available).
+      * The continuum lengthens (extra instructions added).
       * The instruction pressure is biased toward that schedule type.
   - If the prediction is incorrect:
-      * No lengthening occurs.
+      * No extra instructions are added.
       * The continuum continues only while instructions remain; otherwise it stops
         when the instruction budget runs out.
 
-This implements: "correct predictions lengthen and bias the continuum else let
-instructions run out."
+Live display
+------------
+Prints a real-time, updating line per trial and a running summary table.
 
 Measurement note
 ----------------
@@ -34,6 +35,7 @@ from __future__ import annotations
 import argparse
 import csv
 import time
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence, List
@@ -361,10 +363,6 @@ def summarize_one_schedule(events: Sequence[ArrivalEvent], frame_records) -> dic
 
 
 def predict_schedule(stats: dict, rng: np.random.Generator) -> tuple[str, float]:
-    """
-    Simple non-arbitrary predictor based on trial statistics.
-    Returns (predicted_label, confidence).
-    """
     rel_std = stats["std_delay_ns"] / max(stats["mean_delay_ns"], 1.0)
     count_norm = min(1.0, stats["event_count"] / 64.0)
     relstd_score = 1.0 / (1.0 + np.exp(5.0 * (rel_std - 0.5)))
@@ -375,51 +373,30 @@ def predict_schedule(stats: dict, rng: np.random.Generator) -> tuple[str, float]
     return label, conf
 
 
-def run_continuum(
+def run_continuum_live(
     engine: RealOpticalArrivalComparison,
     base_instructions: int,
     rng: np.random.Generator,
-) -> list[ContinuumTrial]:
+    live_delay: float = 0.0,
+):
     """
-    Run a continuum of trials with a finite instruction budget.
-
-    Rules:
-      - Start with `base_instructions` instruction units.
-      - Each trial consumes 1 instruction unit.
-      - If the prediction is correct:
-          * Add extra instructions (lengthen the continuum).
-          * Bias the instruction pressure toward the correct schedule.
-      - If the prediction is incorrect:
-          * No extra instructions are added.
-          * The continuum continues only while instructions remain.
-      - Stop when instructions run out.
+    Generator that yields (trial, running_summary) in real time.
     """
-    results: List[ContinuumTrial] = []
     instructions = base_instructions
-    bias = 0.0  # positive -> bias toward deterministic, negative -> toward random
+    bias = 0.0
     trial_counter = 0
+    history = []
 
     while instructions > 0:
-        # Choose true schedule for this trial
         true_schedule = "deterministic" if rng.random() < 0.5 else "random"
-
-        # Run one trial under that schedule with current bias
         events, frames = engine.run_schedule(true_schedule, trial_offset=trial_counter, bias=bias)
         stats = summarize_one_schedule(events, frames)
-
-        # Predict
         pred_label, conf = predict_schedule(stats, rng)
         correct = (pred_label == true_schedule)
 
-        # Consume one instruction
         instructions -= 1
-
-        # Update instructions and bias based on correctness
         if correct:
-            # Lengthen: add extra instructions
-            extra = 4  # can be tuned
-            instructions += extra
-            # Bias update
+            instructions += 2
             if true_schedule == "deterministic":
                 bias = min(5.0, bias + 0.5)
             else:
@@ -442,18 +419,68 @@ def run_continuum(
             instructions_remaining=instructions,
             continued=continued,
         )
-        results.append(ct)
+        history.append(ct)
+
+        yield ct, list(history)
 
         trial_counter += 1
-
         if not continued:
             break
 
-    return results
+        if live_delay > 0:
+            time.sleep(live_delay)
 
 
 # ==============================================================
-# REPORTING
+# LIVE DISPLAY
+# ==============================================================
+
+def print_header():
+    print("=" * 90)
+    print("CONTINUUM OPTICAL BENCH — LIVE")
+    print("=" * 90)
+    print(f"{'trial':>5} | {'true':>12} | {'pred':>12} | {'correct':>7} | {'conf':>5} | {'instr_left':>10} | {'status':>8}")
+    print("-" * 90)
+    sys.stdout.flush()
+
+
+def print_trial_row(ct: ContinuumTrial):
+    status = "CONTINUE" if ct.continued else "STOP"
+    line = (
+        f"{ct.index:5d} | {ct.true_schedule:>12} | {ct.predicted_label:>12} | "
+        f"{int(ct.correct):>7} | {ct.confidence:5.3f} | {ct.instructions_remaining:10d} | {status:>8}"
+    )
+    print(line)
+    sys.stdout.flush()
+
+
+def print_summary(history: list[ContinuumTrial]):
+    if not history:
+        return
+    n = len(history)
+    correct_count = sum(1 for h in history if h.correct)
+    det_count = sum(1 for h in history if h.true_schedule == "deterministic")
+    ran_count = n - det_count
+    det_correct = sum(1 for h in history if h.true_schedule == "deterministic" and h.correct)
+    ran_correct = sum(1 for h in history if h.true_schedule == "random" and h.correct)
+    avg_conf = np.mean([h.confidence for h in history])
+    final_instr = history[-1].instructions_remaining
+
+    print()
+    print("SUMMARY")
+    print("-" * 90)
+    print(f"trials so far         : {n}")
+    print(f"correct predictions   : {correct_count} / {n}  ({correct_count/n*100:.1f}%)")
+    print(f"deterministic trials  : {det_count}  (correct {det_correct})")
+    print(f"random trials         : {ran_count}  (correct {ran_correct})")
+    print(f"avg confidence        : {avg_conf:.3f}")
+    print(f"instructions remaining: {final_instr}")
+    print("=" * 90)
+    sys.stdout.flush()
+
+
+# ==============================================================
+# CSV OUTPUT
 # ==============================================================
 
 def write_continuum(path: Path, trials: list[ContinuumTrial]):
@@ -472,8 +499,12 @@ def write_continuum(path: Path, trials: list[ContinuumTrial]):
             ])
 
 
+# ==============================================================
+# MAIN
+# ==============================================================
+
 def main():
-    p = argparse.ArgumentParser(description="Continuum optical-bench arrival comparison with instruction pressure and finite instruction budget.")
+    p = argparse.ArgumentParser(description="Continuum optical-bench arrival comparison with live display.")
     p.add_argument("--synthetic", action="store_true", help="Use synthetic frames.")
     p.add_argument("--synthetic-seed", type=int, default=2026)
     p.add_argument("--synthetic-noise", type=float, default=0.03)
@@ -498,6 +529,7 @@ def main():
     p.add_argument("--pressure-strength", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=2026)
     p.add_argument("--output", default="continuum_optical_output")
+    p.add_argument("--live-delay", type=float, default=0.0, help="Artificial delay between trials for live demo.")
     args = p.parse_args()
 
     if args.modes_x <= 0 or args.modes_y <= 0 or args.modes_z <= 0 or args.base_instructions <= 0:
@@ -539,18 +571,17 @@ def main():
         print()
 
         cont_rng = np.random.default_rng(args.seed + 777)
-        continuum_trials = run_continuum(engine, args.base_instructions, cont_rng)
+        print_header()
 
-        print("CONTINUUM TRIALS (instruction budget)")
-        print("-" * 84)
-        for ct in continuum_trials:
-            status = "CONTINUE" if ct.continued else "STOP"
-            print(f"trial={ct.index:2d} true={ct.true_schedule:<12} pred={ct.predicted_label:<12} "
-                  f"correct={int(ct.correct)} conf={ct.confidence:.3f} instr_left={ct.instructions_remaining:2d} [{status}]")
+        all_trials = []
+        for ct, history in run_continuum_live(engine, args.base_instructions, cont_rng, live_delay=args.live_delay):
+            print_trial_row(ct)
+            all_trials = history
+            print_summary(history)
 
         out = Path(args.output)
         out.mkdir(parents=True, exist_ok=True)
-        write_continuum(out / "continuum_trials.csv", continuum_trials)
+        write_continuum(out / "continuum_trials.csv", all_trials)
 
         metadata = {
             "camera_mode": camera_name,
@@ -564,9 +595,9 @@ def main():
             "deterministic_pattern": args.deterministic_pattern,
             "random_pattern": args.random_pattern,
             "pressure_strength": args.pressure_strength,
-            "continuum_length": len(continuum_trials),
-            "final_trial_index": continuum_trials[-1].index if continuum_trials else -1,
-            "final_instructions_remaining": continuum_trials[-1].instructions_remaining if continuum_trials else 0,
+            "continuum_length": len(all_trials),
+            "final_trial_index": all_trials[-1].index if all_trials else -1,
+            "final_instructions_remaining": all_trials[-1].instructions_remaining if all_trials else 0,
             "measurement_note": "Camera frame timing and threshold crossings are arrival proxies.",
             "continuum_rule": "Correct predictions add instructions and bias the continuum; incorrect predictions let instructions run out.",
         }
