@@ -1192,7 +1192,158 @@ def save_run(
                 ]
             )
 
+def show_statevector(
+    amplitudes,
+    probabilities,
+    rows,
+    cols,
+    top_k=32
+):
+    amplitudes = np.asarray(
+        amplitudes,
+        dtype=np.complex128
+    )
 
+    probabilities = np.asarray(
+        probabilities,
+        dtype=np.float64
+    )
+
+    modes = len(amplitudes)
+
+    qubits = int(
+        math.log2(modes)
+    )
+
+    print()
+    print("=" * 90)
+    print("OPTICAL BENCH STATEVECTOR REPRESENTATION")
+    print("=" * 90)
+
+    print(
+        f"Optical plane       : {rows} × {cols}"
+    )
+
+    print(
+        f"Optical modes       : {modes}"
+    )
+
+    print(
+        f"Logical qubits      : {qubits}"
+    )
+
+    print(
+        f"Statevector length  : {len(amplitudes)}"
+    )
+
+    print(
+        f"Norm                : "
+        f"{np.linalg.norm(amplitudes):.12f}"
+    )
+
+    print(
+        f"Probability sum     : "
+        f"{probabilities.sum():.12f}"
+    )
+
+    print()
+    print(
+        "|ψ⟩ = Σᵢ aᵢ|i⟩"
+    )
+
+    print()
+    print(
+        "The optical bench supplies the amplitudes aᵢ."
+    )
+
+    print(
+        "Each |i⟩ is one spatial optical mode."
+    )
+
+    print()
+
+    order = np.argsort(
+        probabilities
+    )[::-1][:top_k]
+
+    print(
+        "DOMINANT STATEVECTOR COMPONENTS"
+    )
+
+    print(
+        "-" * 90
+    )
+
+    for mode in order:
+
+        mode = int(mode)
+
+        row = mode // cols
+        col = mode % cols
+
+        bits = format(
+            mode,
+            f"0{qubits}b"
+        )
+
+        amplitude = amplitudes[mode]
+
+        probability = float(
+            probabilities[mode]
+        )
+
+        if is_prime(mode):
+            value_label = f"prime={mode}"
+        else:
+            value_label = f"decimal={mode}"
+
+        print(
+            f"mode={mode:5d} "
+            f"|{bits}> "
+            f"{value_label} "
+            f"optical=({row},{col}) "
+            f"a={amplitude.real:.10f} "
+            f"p={probability:.8f}"
+        )
+
+    print()
+    print(
+        "Statevector interpretation:"
+    )
+
+    print(
+        "mode → spatial optical location"
+    )
+
+    print(
+        "binary → Qiskit computational basis state"
+    )
+
+    print(
+        "a → normalized optical amplitude"
+    )
+
+    print(
+        "|a|² → measurement probability"
+    )
+
+def is_prime(n: int) -> bool:
+    if n < 2:
+        return False
+
+    if n == 2:
+        return True
+
+    if n % 2 == 0:
+        return False
+
+    limit = math.isqrt(n)
+
+    for d in range(3, limit + 1, 2):
+        if n % d == 0:
+            return False
+
+    return True
 # ============================================================
 # MAIN
 # ============================================================
@@ -1578,7 +1729,13 @@ def main():
                 prime_only=args.prime_only
             )
         )
-
+        show_statevector(
+            amplitudes=amplitudes,
+            probabilities=probabilities,
+            rows=args.modes_y,
+            cols=args.modes_x,
+            top_k=32
+        )                    
         # ----------------------------------------------------
         # QISKIT
         # ----------------------------------------------------
@@ -1601,111 +1758,10 @@ def main():
         # REPORT
         # ----------------------------------------------------
 
-        print()
-        print("=" * 72)
-        print("OPTICAL STATE")
-        print("=" * 72)
-
-        print(
-            f"Amplitude elements : "
-            f"{len(amplitudes)}"
-        )
-
-        print(
-            f"Logical qubits     : "
-            f"{qiskit_backend.qubits}"
-        )
-
-        print(
-            f"State norm         : "
-            f"{np.linalg.norm(amplitudes):.12f}"
-        )
-
-        print(
-            f"Probability sum    : "
-            f"{probabilities.sum():.12f}"
-        )
-
-        print()
-
-        print(
-            "Top optical modes:"
-        )
-
-        top = np.argsort(
-            probabilities
-        )[::-1][:32]
-
-        for mode in top:
-
-            bits = format(
-                int(mode),
-                f"0{qiskit_backend.qubits}b"
-            )
-
-            print(
-                f"mode={mode:5d} "
-                f"|{bits}> "
-                f"p={probabilities[mode]:.8f}"
-            )
-
-        # ----------------------------------------------------
-        # QISKIT RESULTS
-        # ----------------------------------------------------
-
-        print()
-        print("=" * 72)
-        print("QISKIT RESULTS")
-        print("=" * 72)
-
-        total = max(
-            sum(counts.values()),
-            1
-        )
-
-        for bits, count in sorted(
-            counts.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )[:32]:
-
-            print(
-                f"|{bits}> "
-                f"count={count:6d} "
-                f"p={count / total:.8f}"
-            )
-
-        # ----------------------------------------------------
-        # SAVE
-        # ----------------------------------------------------
-
-        save_run(
-            args.output,
-            pattern,
-            frame,
-            measured_modes,
-            amplitudes,
-            probabilities,
-            counts,
-            circuit
-        )
-
-        print()
-        print(
-            "=" * 72
-        )
-
-        print(
-            f"Results saved to: {args.output}"
-        )
-
-    finally:
-
-        ito.close()
-
-        camera.close()
-
-
+            
+        
+    except:
+        False
 # ============================================================
 # ENTRY POINT
 # ============================================================
