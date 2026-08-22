@@ -1,27 +1,32 @@
 #!/usr/bin/env python3
 """
-real_optical_bench_arrival_compare.py
+continuum_optical_bench_arrival.py
 
-Real optical bench + ITO spatial modulator + streamed temporal bins.
-Compares camera-derived optical arrival proxies after an unblock command
-for deterministic and random instruction schedules.
+Real/synthetic optical bench + ITO spatial modulator + streamed temporal bins.
+Compares photon arrival proxies after unblocking under:
+  - deterministically sampled futures
+  - randomly sampled futures
+driven by an existent instruction pressure.
 
-Predictor
----------
-Uses a *non-arbitrary* predictor that conditions on observed trial features
-(event count, delay statistics, intensities, ITO activity) to guess
-"deterministic" or "random". Confidence is derived from the classifier score.
+Continuum rule (updated)
+------------------------
+Trials are run sequentially in a continuum with a finite instruction budget.
+For each trial:
+  - A predictor guesses "deterministic" vs "random" from the data.
+  - If the prediction is correct:
+      * The continuum lengthens (more trials become available).
+      * The instruction pressure is biased toward that schedule type.
+  - If the prediction is incorrect:
+      * No lengthening occurs.
+      * The continuum continues only while instructions remain; otherwise it stops
+        when the instruction budget runs out.
 
-Important measurement note
---------------------------
-A normal USB/CMOS camera does not time-tag individual photons. This program
-therefore records a frame timestamp and treats a thresholded optical response
-in each camera-derived spatial mode as an arrival proxy. For single-photon
-arrival-time measurements, replace or supplement OpticalCamera with a hardware
-TDC/SPAD/TCSPC backend that yields event timestamps.
+This implements: "correct predictions lengthen and bias the continuum else let
+instructions run out."
 
-The program never materializes a [schedule, temporal_bin, spatial_mode] cube.
-It processes one frame and one spatial plane at a time.
+Measurement note
+----------------
+Camera frame timing is an arrival proxy, not single-photon time tagging.
 """
 
 from __future__ import annotations
@@ -31,7 +36,7 @@ import csv
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Sequence, List
 
 import cv2
 import numpy as np
@@ -264,173 +269,185 @@ class RealOpticalArrivalComparison:
         self.pressure_strength = float(pressure_strength)
         self.rng = np.random.default_rng(rng_seed)
 
-    def _instruction_index(self, schedule: str, trial: int, temporal_bin: int):
+    def _instruction_index(self, schedule: str, trial: int, temporal_bin: int, bias: float):
         deterministic = self.base_pattern_index + trial * self.temporal_bins + temporal_bin
         if schedule == "deterministic":
             return deterministic
-        span = max(1, int(abs(self.pressure_strength) * 1_000_003))
+        span = max(1, int(abs(self.pressure_strength * (1.0 + bias)) * 1_000_003))
         return deterministic + int(self.rng.integers(0, span))
 
-    def _pattern(self, schedule: str, trial: int, temporal_bin: int):
-        index = self._instruction_index(schedule, trial, temporal_bin)
+    def _pattern(self, schedule: str, trial: int, temporal_bin: int, bias: float):
+        index = self._instruction_index(schedule, trial, temporal_bin, bias)
         kind = self.deterministic_pattern if schedule == "deterministic" else self.random_pattern
         return ITOController.generate_pattern(self.rows, self.cols, kind, index, self.rng)
 
-    def run_schedule(self, schedule: str, trials: int):
+    def run_schedule(self, schedule: str, trial_offset: int, bias: float):
         events = []
         frame_records = []
-        for trial in range(trials):
-            command_time_ns = time.perf_counter_ns()
-            for t in range(self.temporal_bins):
-                pattern = self._pattern(schedule, trial, t)
-                self.ito.send_pattern(pattern)
-                frame = self.bench.acquire()
-                frame_time_ns = time.perf_counter_ns()
-                modes = self.bench.measure_modes(frame).reshape(-1)
-                expected_proxy_ns = command_time_ns + int((t + 1) * self.bin_period_s * 1e9)
-                timestamp_ns = max(frame_time_ns, expected_proxy_ns)
-                active = pattern.reshape(-1).astype(bool)
-                for s, intensity in enumerate(modes):
-                    admitted = int(active[s] and intensity >= self.threshold)
-                    if admitted:
-                        events.append(ArrivalEvent(
-                            schedule=schedule,
-                            trial=trial,
-                            temporal_bin=t,
-                            spatial_mode=s,
-                            logical_mode=t * self.spatial_modes + s,
-                            command_time_ns=command_time_ns,
-                            frame_time_ns=frame_time_ns,
-                            arrival_proxy_ns=timestamp_ns,
-                            delay_after_unblock_ns=timestamp_ns-command_time_ns,
-                            intensity=float(intensity),
-                            admitted=1,
-                        ))
-                frame_records.append((schedule, trial, t, command_time_ns, frame_time_ns, float(modes.sum()), int(active.sum())))
-                del frame, modes, pattern
+        command_time_ns = time.perf_counter_ns()
+        for t in range(self.temporal_bins):
+            pattern = self._pattern(schedule, trial_offset, t, bias)
+            self.ito.send_pattern(pattern)
+            frame = self.bench.acquire()
+            frame_time_ns = time.perf_counter_ns()
+            modes = self.bench.measure_modes(frame).reshape(-1)
+            expected_proxy_ns = command_time_ns + int((t + 1) * self.bin_period_s * 1e9)
+            timestamp_ns = max(frame_time_ns, expected_proxy_ns)
+            active = pattern.reshape(-1).astype(bool)
+            for s, intensity in enumerate(modes):
+                admitted = int(active[s] and intensity >= self.threshold)
+                if admitted:
+                    events.append(ArrivalEvent(
+                        schedule=schedule,
+                        trial=trial_offset,
+                        temporal_bin=t,
+                        spatial_mode=s,
+                        logical_mode=t * self.spatial_modes + s,
+                        command_time_ns=command_time_ns,
+                        frame_time_ns=frame_time_ns,
+                        arrival_proxy_ns=timestamp_ns,
+                        delay_after_unblock_ns=timestamp_ns-command_time_ns,
+                        intensity=float(intensity),
+                        admitted=1,
+                    ))
+            frame_records.append((schedule, trial_offset, t, command_time_ns, frame_time_ns, float(modes.sum()), int(active.sum())))
+            del frame, modes, pattern
         return events, frame_records
 
 
 # ==============================================================
-# NON-ARBITRARY PREDICTOR
+# CONTINUUM EXPERIMENT
 # ==============================================================
 
 @dataclass
-class TrialSummary:
-    schedule: str
-    trial: int
+class ContinuumTrial:
+    index: int
+    true_schedule: str
     event_count: int
     mean_delay_ns: float
     std_delay_ns: float
     mean_intensity: float
     active_ito_cells: int
     total_mode_intensity: float
+    predicted_label: str
+    confidence: float
+    correct: bool
+    instructions_remaining: int
+    continued: bool
 
 
-def summarize_trials(events: Sequence[ArrivalEvent], frame_records) -> list[TrialSummary]:
-    by_trial = {}
-    for e in events:
-        key = (e.schedule, e.trial)
-        if key not in by_trial:
-            by_trial[key] = []
-        by_trial[key].append(e)
-
-    frame_by_trial = {}
-    for rec in frame_records:
-        sched, trial, t, cmd_ns, frame_ns, total_int, active_cells = rec
-        key = (sched, trial)
-        if key not in frame_by_trial:
-            frame_by_trial[key] = []
-        frame_by_trial[key].append((t, total_int, active_cells))
-
-    summaries = []
-    for (schedule, trial), evs in by_trial.items():
-        delays = np.asarray([ev.delay_after_unblock_ns for ev in evs], dtype=np.float64)
-        intensities = np.asarray([ev.intensity for ev in evs], dtype=np.float64)
-        frames = frame_by_trial.get((schedule, trial), [])
-        total_int = sum(f[1] for f in frames)
-        active_cells = sum(f[2] for f in frames)
-        summaries.append(TrialSummary(
-            schedule=schedule,
-            trial=trial,
-            event_count=int(delays.size),
-            mean_delay_ns=float(delays.mean()) if delays.size else 0.0,
-            std_delay_ns=float(delays.std()) if delays.size else 0.0,
-            mean_intensity=float(intensities.mean()) if intensities.size else 0.0,
-            active_ito_cells=active_cells,
-            total_mode_intensity=total_int,
-        ))
-    return summaries
+def summarize_one_schedule(events: Sequence[ArrivalEvent], frame_records) -> dict:
+    if not events:
+        return {
+            "event_count": 0,
+            "mean_delay_ns": 0.0,
+            "std_delay_ns": 0.0,
+            "mean_intensity": 0.0,
+            "active_ito_cells": 0,
+            "total_mode_intensity": 0.0,
+        }
+    delays = np.asarray([e.delay_after_unblock_ns for e in events], dtype=np.float64)
+    intensities = np.asarray([e.intensity for e in events], dtype=np.float64)
+    total_int = sum(r[5] for r in frame_records)
+    active_cells = sum(r[6] for r in frame_records)
+    return {
+        "event_count": int(delays.size),
+        "mean_delay_ns": float(delays.mean()) if delays.size else 0.0,
+        "std_delay_ns": float(delays.std()) if delays.size else 0.0,
+        "mean_intensity": float(intensities.mean()) if intensities.size else 0.0,
+        "active_ito_cells": int(active_cells),
+        "total_mode_intensity": float(total_int),
+    }
 
 
-def predict_non_arbitrary(summaries: list[TrialSummary], rng: np.random.Generator) -> list[tuple[TrialSummary, str, float]]:
+def predict_schedule(stats: dict, rng: np.random.Generator) -> tuple[str, float]:
     """
-    Non-arbitrary predictor:
-
-    For each trial summary s, compute a score that tends to be higher for
-    deterministic-like patterns and lower for random-like patterns, then
-    map that score through a sigmoid to get P(deterministic).
-
-    Heuristic features (can be tuned):
-      - event_count: deterministic schedules often have more stable counts
-      - std_delay_ns / mean_delay_ns: random schedules may show higher relative variance
-      - active_ito_cells / total_mode_intensity: pattern structure differences
-
-    This is intentionally simple and not trained; it just illustrates a
-    data-dependent predictor.
+    Simple non-arbitrary predictor based on trial statistics.
+    Returns (predicted_label, confidence).
     """
-    results = []
+    rel_std = stats["std_delay_ns"] / max(stats["mean_delay_ns"], 1.0)
+    count_norm = min(1.0, stats["event_count"] / 64.0)
+    relstd_score = 1.0 / (1.0 + np.exp(5.0 * (rel_std - 0.5)))
+    score = 0.6 * count_norm + 0.4 * relstd_score
+    p_det = 1.0 / (1.0 + np.exp(-4.0 * (score - 0.5)))
+    label = "deterministic" if rng.random() < p_det else "random"
+    conf = float(max(p_det, 1.0 - p_det))
+    return label, conf
 
-    # Collect global stats for normalization
-    if len(summaries) == 0:
-        return results
 
-    event_counts = np.array([s.event_count for s in summaries], dtype=np.float64)
-    mean_delays = np.array([s.mean_delay_ns for s in summaries], dtype=np.float64)
-    std_delays = np.array([s.std_delay_ns for s in summaries], dtype=np.float64)
-    mean_intensities = np.array([s.mean_intensity for s in summaries], dtype=np.float64)
-    active_cells = np.array([s.active_ito_cells for s in summaries], dtype=np.float64)
-    total_intensities = np.array([s.total_mode_intensity for s in summaries], dtype=np.float64)
+def run_continuum(
+    engine: RealOpticalArrivalComparison,
+    base_instructions: int,
+    rng: np.random.Generator,
+) -> list[ContinuumTrial]:
+    """
+    Run a continuum of trials with a finite instruction budget.
 
-    # Avoid division by zero
-    mean_delays_safe = np.where(mean_delays > 0, mean_delays, 1.0)
-    rel_std = std_delays / mean_delays_safe
+    Rules:
+      - Start with `base_instructions` instruction units.
+      - Each trial consumes 1 instruction unit.
+      - If the prediction is correct:
+          * Add extra instructions (lengthen the continuum).
+          * Bias the instruction pressure toward the correct schedule.
+      - If the prediction is incorrect:
+          * No extra instructions are added.
+          * The continuum continues only while instructions remain.
+      - Stop when instructions run out.
+    """
+    results: List[ContinuumTrial] = []
+    instructions = base_instructions
+    bias = 0.0  # positive -> bias toward deterministic, negative -> toward random
+    trial_counter = 0
 
-    # Normalize features roughly to [0,1] ranges using robust scaling
-    def robust_scale(x):
-        med = np.median(x)
-        q1, q3 = np.percentile(x, [25, 75])
-        iqr = q3 - q1
-        if iqr == 0:
-            iqr = 1.0
-        z = (x - med) / iqr
-        # squash to ~[0,1] via sigmoid-like mapping
-        return 1.0 / (1.0 + np.exp(-z))
+    while instructions > 0:
+        # Choose true schedule for this trial
+        true_schedule = "deterministic" if rng.random() < 0.5 else "random"
 
-    f_count = robust_scale(event_counts)
-    f_relstd = robust_scale(-rel_std)  # lower rel_std -> more deterministic-like
-    f_intensity = robust_scale(mean_intensities)
-    f_activity = robust_scale(active_cells / np.where(total_intensities > 0, total_intensities, 1.0))
+        # Run one trial under that schedule with current bias
+        events, frames = engine.run_schedule(true_schedule, trial_offset=trial_counter, bias=bias)
+        stats = summarize_one_schedule(events, frames)
 
-    # Simple linear combination
-    # Positive weights for count, intensity, activity; negative for relative std
-    score = (
-        1.0 * f_count
-        + 1.5 * f_relstd
-        + 0.5 * f_intensity
-        + 0.5 * f_activity
-    )
+        # Predict
+        pred_label, conf = predict_schedule(stats, rng)
+        correct = (pred_label == true_schedule)
 
-    # Map score to probability via sigmoid with adjustable center/slope
-    center = 2.0
-    slope = 2.0
-    p_det = 1.0 / (1.0 + np.exp(-slope * (score - center)))
+        # Consume one instruction
+        instructions -= 1
 
-    for s, pd in zip(summaries, p_det):
-        # Randomized decision based on p_det
-        label = "deterministic" if rng.random() < pd else "random"
-        conf = float(max(pd, 1.0 - pd))
-        results.append((s, label, conf))
+        # Update instructions and bias based on correctness
+        if correct:
+            # Lengthen: add extra instructions
+            extra = 4  # can be tuned
+            instructions += extra
+            # Bias update
+            if true_schedule == "deterministic":
+                bias = min(5.0, bias + 0.5)
+            else:
+                bias = max(-5.0, bias - 0.5)
+
+        continued = (instructions > 0)
+
+        ct = ContinuumTrial(
+            index=trial_counter,
+            true_schedule=true_schedule,
+            event_count=stats["event_count"],
+            mean_delay_ns=stats["mean_delay_ns"],
+            std_delay_ns=stats["std_delay_ns"],
+            mean_intensity=stats["mean_intensity"],
+            active_ito_cells=stats["active_ito_cells"],
+            total_mode_intensity=stats["total_mode_intensity"],
+            predicted_label=pred_label,
+            confidence=conf,
+            correct=correct,
+            instructions_remaining=instructions,
+            continued=continued,
+        )
+        results.append(ct)
+
+        trial_counter += 1
+
+        if not continued:
+            break
 
     return results
 
@@ -439,61 +456,25 @@ def predict_non_arbitrary(summaries: list[TrialSummary], rng: np.random.Generato
 # REPORTING
 # ==============================================================
 
-def stats(events: Sequence[ArrivalEvent]):
-    if not events:
-        return {"count": 0, "mean_ns": None, "std_ns": None, "min_ns": None, "max_ns": None}
-    x = np.asarray([e.delay_after_unblock_ns for e in events], dtype=np.float64)
-    return {
-        "count": int(x.size),
-        "mean_ns": float(x.mean()),
-        "std_ns": float(x.std()),
-        "min_ns": float(x.min()),
-        "max_ns": float(x.max()),
-    }
-
-
-def write_events(path: Path, events: Sequence[ArrivalEvent]):
+def write_continuum(path: Path, trials: list[ContinuumTrial]):
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow([
-            "schedule", "trial", "temporal_bin", "spatial_mode", "logical_mode",
-            "command_time_ns", "frame_time_ns", "arrival_proxy_ns",
-            "delay_after_unblock_ns", "intensity", "admitted",
-        ])
-        for e in events:
-            w.writerow([
-                e.schedule, e.trial, e.temporal_bin, e.spatial_mode, e.logical_mode,
-                e.command_time_ns, e.frame_time_ns, e.arrival_proxy_ns,
-                e.delay_after_unblock_ns, e.intensity, e.admitted,
-            ])
-
-
-def write_frames(path: Path, records):
-    with path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["schedule", "trial", "temporal_bin", "command_time_ns", "frame_time_ns", "total_mode_intensity", "active_ito_cells"])
-        w.writerows(records)
-
-
-def write_predictions(path: Path, predictions: list[tuple[TrialSummary, str, float]]):
-    with path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow([
-            "schedule", "trial", "event_count", "mean_delay_ns", "std_delay_ns",
+            "index", "true_schedule", "event_count", "mean_delay_ns", "std_delay_ns",
             "mean_intensity", "active_ito_cells", "total_mode_intensity",
-            "predicted_label", "confidence",
+            "predicted_label", "confidence", "correct", "instructions_remaining", "continued",
         ])
-        for s, label, conf in predictions:
+        for t in trials:
             w.writerow([
-                s.schedule, s.trial, s.event_count, s.mean_delay_ns, s.std_delay_ns,
-                s.mean_intensity, s.active_ito_cells, s.total_mode_intensity,
-                label, conf,
+                t.index, t.true_schedule, t.event_count, t.mean_delay_ns, t.std_delay_ns,
+                t.mean_intensity, t.active_ito_cells, t.total_mode_intensity,
+                t.predicted_label, t.confidence, int(t.correct), t.instructions_remaining, int(t.continued),
             ])
 
 
 def main():
-    p = argparse.ArgumentParser(description="Real optical-bench arrival-proxy comparison after ITO unblocking with non-arbitrary predictor.")
-    p.add_argument("--synthetic", action="store_true", help="Use synthetic frames instead of a physical camera.")
+    p = argparse.ArgumentParser(description="Continuum optical-bench arrival comparison with instruction pressure and finite instruction budget.")
+    p.add_argument("--synthetic", action="store_true", help="Use synthetic frames.")
     p.add_argument("--synthetic-seed", type=int, default=2026)
     p.add_argument("--synthetic-noise", type=float, default=0.03)
     p.add_argument("--camera", type=int, default=0)
@@ -505,22 +486,22 @@ def main():
     p.add_argument("--modes-x", type=int, default=4)
     p.add_argument("--modes-y", type=int, default=4)
     p.add_argument("--modes-z", type=int, default=1, help="Temporal bins per unblock trial.")
-    p.add_argument("--trials", type=int, default=8, help="Unblock trials for each schedule.")
+    p.add_argument("--base-instructions", type=int, default=10, help="Initial instruction budget.")
     p.add_argument("--bin-period", type=float, default=0.050, help="Nominal temporal-bin period, seconds.")
-    p.add_argument("--threshold", type=float, default=30.0, help="Camera-mode intensity threshold for an arrival proxy.")
-    p.add_argument("--serial", default=None, help="ITO serial port, for example COM3 or /dev/ttyUSB0.")
+    p.add_argument("--threshold", type=float, default=30.0, help="Intensity threshold for arrival proxy.")
+    p.add_argument("--serial", default=None, help="ITO serial port.")
     p.add_argument("--baudrate", type=int, default=115200)
-    p.add_argument("--settle", type=float, default=0.050, help="ITO settle time after each pattern, seconds.")
+    p.add_argument("--settle", type=float, default=0.050, help="ITO settle time, seconds.")
     p.add_argument("--deterministic-pattern", choices=["single", "checker", "row", "column", "diagonal", "binary", "open", "blocked"], default="single")
     p.add_argument("--random-pattern", choices=["random", "single", "checker", "row", "column", "diagonal", "binary", "open", "blocked"], default="random")
     p.add_argument("--pattern-index", type=int, default=0)
-    p.add_argument("--pressure-strength", type=float, default=1.0, help="Range scaling for random instruction indices.")
+    p.add_argument("--pressure-strength", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=2026)
-    p.add_argument("--output", default="real_optical_arrival_output")
+    p.add_argument("--output", default="continuum_optical_output")
     args = p.parse_args()
 
-    if args.modes_x <= 0 or args.modes_y <= 0 or args.modes_z <= 0 or args.trials <= 0:
-        raise ValueError("modes-x, modes-y, modes-z, and trials must be > 0")
+    if args.modes_x <= 0 or args.modes_y <= 0 or args.modes_z <= 0 or args.base_instructions <= 0:
+        raise ValueError("modes-x, modes-y, modes-z, and base-instructions must be > 0")
     if args.bin_period <= 0:
         raise ValueError("--bin-period must be > 0")
 
@@ -553,36 +534,23 @@ def main():
         print(f"ITO SERIAL PORT           : {args.serial if args.serial else 'none (timed dry-run)'}")
         print(f"SPATIAL MODES             : {args.modes_y} x {args.modes_x} = {args.modes_y * args.modes_x}")
         print(f"TEMPORAL BINS / TRIAL     : {args.modes_z}")
-        print(f"UNBLOCK TRIALS / SCHEDULE : {args.trials}")
+        print(f"BASE INSTRUCTIONS         : {args.base_instructions}")
         print(f"ARRIVAL THRESHOLD         : {args.threshold}")
         print()
 
-        deterministic_events, deterministic_frames = engine.run_schedule("deterministic", args.trials)
-        random_events, random_frames = engine.run_schedule("random", args.trials)
+        cont_rng = np.random.default_rng(args.seed + 777)
+        continuum_trials = run_continuum(engine, args.base_instructions, cont_rng)
 
-        sd = stats(deterministic_events)
-        sr = stats(random_events)
-        print("ARRIVAL-PROXY DELAY AFTER UNBLOCK (ns)")
-        print("-" * 72)
-        print(f"deterministic: events={sd['count']}, mean={sd['mean_ns']}, std={sd['std_ns']}, min={sd['min_ns']}, max={sd['max_ns']}")
-        print(f"random       : events={sr['count']}, mean={sr['mean_ns']}, std={sr['std_ns']}, min={sr['min_ns']}, max={sr['max_ns']}")
-
-        # Summarize per-trial
-        all_frames = deterministic_frames + random_frames
-        all_events = deterministic_events + random_events
-        summaries = summarize_trials(all_events, all_frames)
-
-        # Non-arbitrary predictions
-        pred_rng = np.random.default_rng(args.seed + 999)
-        predictions = predict_non_arbitrary(summaries, pred_rng)
+        print("CONTINUUM TRIALS (instruction budget)")
+        print("-" * 84)
+        for ct in continuum_trials:
+            status = "CONTINUE" if ct.continued else "STOP"
+            print(f"trial={ct.index:2d} true={ct.true_schedule:<12} pred={ct.predicted_label:<12} "
+                  f"correct={int(ct.correct)} conf={ct.confidence:.3f} instr_left={ct.instructions_remaining:2d} [{status}]")
 
         out = Path(args.output)
         out.mkdir(parents=True, exist_ok=True)
-        write_events(out / "deterministic_arrival_events.csv", deterministic_events)
-        write_events(out / "random_arrival_events.csv", random_events)
-        write_frames(out / "deterministic_frame_records.csv", deterministic_frames)
-        write_frames(out / "random_frame_records.csv", random_frames)
-        write_predictions(out / "trial_predictions_non_arbitrary.csv", predictions)
+        write_continuum(out / "continuum_trials.csv", continuum_trials)
 
         metadata = {
             "camera_mode": camera_name,
@@ -590,21 +558,20 @@ def main():
             "modes_x": args.modes_x,
             "modes_y": args.modes_y,
             "temporal_bins": args.modes_z,
-            "trials_per_schedule": args.trials,
+            "base_instructions": args.base_instructions,
             "bin_period_s": args.bin_period,
             "threshold": args.threshold,
             "deterministic_pattern": args.deterministic_pattern,
             "random_pattern": args.random_pattern,
             "pressure_strength": args.pressure_strength,
-            "deterministic_stats": sd,
-            "random_stats": sr,
-            "measurement_note": "Camera frame timing and threshold crossings are arrival proxies, not single-photon time tags.",
-            "predictor_note": "Non-arbitrary predictor uses event counts, delay variance, intensities, and ITO activity to estimate P(deterministic).",
+            "continuum_length": len(continuum_trials),
+            "final_trial_index": continuum_trials[-1].index if continuum_trials else -1,
+            "final_instructions_remaining": continuum_trials[-1].instructions_remaining if continuum_trials else 0,
+            "measurement_note": "Camera frame timing and threshold crossings are arrival proxies.",
+            "continuum_rule": "Correct predictions add instructions and bias the continuum; incorrect predictions let instructions run out.",
         }
         (out / "metadata.txt").write_text("\n".join(f"{k} = {v}" for k, v in metadata.items()), encoding="utf-8")
-
         print(f"\nSaved results to: {out}")
-        print("Non-arbitrary predictions written to: trial_predictions_non_arbitrary.csv")
     finally:
         camera.close()
         ito.close()
