@@ -1,110 +1,74 @@
 #!/usr/bin/env python3
 """
-REAL OPTICAL BENCH -> QISKIT
-============================
+automatic_ito_optical_qiskit.py
 
-NO POLARISER.
+REAL OPTICAL BENCH -> AUTOMATIC ITO PATTERN -> QISKIT
 
-The physical optical bench is the computational front-end.
+NO POLARISER
+NO pattern.txt
+NO synthetic optical plane
+NO giant 32768 x 32768 NumPy allocation
 
-Architecture
-------------
+The physical optical bench performs the optical transformation.
 
-        LASER / OPTICAL SOURCE
-                 |
-                 v
-       50 mm ITO DEVICE
-       electrically driven
-                 |
-                 v
-       FREE-SPACE OPTICAL
-          PROPAGATION
-                 |
-                 v
-       CAMERA / DETECTOR
-                 |
-                 v
-       1024 OPTICAL MODES
-             32 x 32
-                 |
-                 v
-       OPTICAL STATE VECTOR
-             1024
-                 |
-                 v
-          10 QUBIT QISKIT
-             STATE
-                 |
-                 v
-            MEASUREMENT
+Workflow:
 
-
-IMPORTANT:
-
-The program does NOT generate a fake optical matrix.
-
-The camera is the source of the optical data.
-
-The large physical optical plane can be arbitrarily large.
-Only the measured detector data is retained.
+    Python-generated binary pattern
+                |
+                v
+        ITO electrical controller
+                |
+                v
+          physical ITO
+                |
+                v
+        optical propagation
+                |
+                v
+             camera
+                |
+                v
+       measured intensity
+                |
+                v
+        optical mode grid
+                |
+                v
+        optical amplitudes
+                |
+                v
+       compact Qiskit state
 
 
-No 32768 x 32768 NumPy matrix is created.
+Default:
 
-No 32768 x 32768 Qiskit statevector is created.
-
-For 1024 modes:
-
-    1024 = 2^10
-
-so the measured optical state corresponds to 10 logical qubits.
-
-Install:
-
-    python -m pip install numpy opencv-python qiskit
-
-Optional serial ITO control:
-
-    python -m pip install pyserial
+    32 x 32 ITO pattern
+    1024 optical modes
+    10 logical qubits
 
 
-Example:
+IMPORTANT HARDWARE NOTE
 
-    python optical_bench.py ^
-        --camera 0 ^
-        --camera-width 1920 ^
-        --camera-height 1080 ^
-        --modes-x 32 ^
-        --modes-y 32 ^
-        --shots 8192
+The serial packet protocol below is a generic protocol.
 
-With ROI:
+Your actual ITO controller may use:
 
-    python optical_bench.py ^
-        --camera 0 ^
-        --roi 100 100 1600 800 ^
-        --modes-x 32 ^
-        --modes-y 32
+    Arduino
+    ESP32
+    DAC
+    shift registers
+    row/column multiplexing
+    GPIO
+    analogue voltage
+    SPI
+    I2C
 
-Prime optical modes:
+Only send_pattern() needs to be changed to match that
+controller.
 
-    python optical_bench.py ^
-        --camera 0 ^
-        --prime-only
-
-
-ITO serial control:
-
-    python optical_bench.py ^
-        --camera 0 ^
-        --serial COM3 ^
-        --pattern pattern.txt
-
-The exact serial protocol of the physical ITO controller is
-device-dependent. The serial implementation below sends a
-simple ASCII representation and should be adapted to the
-actual controller firmware.
+The optical measurement path remains the same.
 """
+
 
 from __future__ import annotations
 
@@ -115,7 +79,7 @@ import time
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -141,7 +105,6 @@ except ImportError:
 # ============================================================
 
 try:
-
     import serial
 
     SERIAL_AVAILABLE = True
@@ -152,63 +115,28 @@ except ImportError:
 
 
 # ============================================================
-# CONFIGURATION
+# CAMERA
 # ============================================================
 
 @dataclass
 class CameraConfig:
 
-    camera_index: int = 0
+    index: int = 0
 
     width: int = 1920
+
     height: int = 1080
 
     exposure: Optional[float] = None
+
     gain: Optional[float] = None
 
-    warmup_frames: int = 20
+    warmup: int = 20
 
 
-@dataclass
-class OpticalConfig:
-
-    modes_x: int = 32
-    modes_y: int = 32
-
-    roi: Optional[tuple[int, int, int, int]] = None
-
-    background_path: Optional[str] = None
-
-    flat_field_path: Optional[str] = None
-
-    prime_only: bool = False
-
-    output_dir: str = "optical_output"
-
-
-@dataclass
-class ITOConfig:
-
-    serial_port: Optional[str] = None
-
-    baudrate: int = 115200
-
-    pattern_path: Optional[str] = None
-
-    settle_time: float = 0.05
-
-
-# ============================================================
-# REAL CAMERA
-# ============================================================
-
-class RealOpticalCamera:
+class OpticalCamera:
     """
-    Real camera interface.
-
-    This is the optical detector.
-
-    No synthetic image generation occurs here.
+    Real camera attached to the optical bench.
     """
 
     def __init__(
@@ -219,14 +147,13 @@ class RealOpticalCamera:
         self.config = config
 
         self.cap = cv2.VideoCapture(
-            config.camera_index
+            config.index
         )
 
         if not self.cap.isOpened():
 
             raise RuntimeError(
-                f"Unable to open camera "
-                f"{config.camera_index}"
+                f"Cannot open camera {config.index}"
             )
 
         self.cap.set(
@@ -254,46 +181,32 @@ class RealOpticalCamera:
             )
 
         for _ in range(
-            max(
-                0,
-                config.warmup_frames
-            )
+            config.warmup
         ):
 
             self.read()
 
     # --------------------------------------------------------
 
-    def read(self) -> np.ndarray:
+    def read(self):
 
         ok, frame = self.cap.read()
 
         if not ok or frame is None:
 
             raise RuntimeError(
-                "Optical camera frame acquisition failed"
+                "Camera acquisition failed"
             )
-
-        # Direct intensity measurement.
-        #
-        # No polarisation analysis.
-        #
-        # RGB is reduced to detector intensity.
 
         if frame.ndim == 3:
 
-            gray = cv2.cvtColor(
+            frame = cv2.cvtColor(
                 frame,
                 cv2.COLOR_BGR2GRAY
             )
 
-        else:
-
-            gray = frame
-
-        return gray.astype(
-            np.float32,
-            copy=False
+        return frame.astype(
+            np.float64
         )
 
     # --------------------------------------------------------
@@ -308,129 +221,209 @@ class RealOpticalCamera:
 
 
 # ============================================================
-# ITO DEVICE
+# ITO CONTROLLER
 # ============================================================
 
-class ITODevice:
+class ITOController:
     """
-    Interface to the electronically controlled ITO plane.
+    Automatic binary ITO pattern generator/controller.
 
-    The optical calculation occurs physically in the bench.
+    No pattern file is required.
 
-    This class does NOT emulate the optical effect.
-
-    The serial portion is intentionally simple because the
-    exact electrode-controller protocol is specific to the
-    user's hardware.
+    Python creates each pattern in memory and immediately
+    transmits it to the physical controller.
     """
 
     def __init__(
         self,
-        config: ITOConfig
+        port: Optional[str],
+        baudrate: int = 115200,
+        settle_time: float = 0.05
     ):
 
-        self.config = config
-        self.connection = None
+        self.port = port
 
-        if config.serial_port is not None:
+        self.baudrate = baudrate
+
+        self.settle_time = settle_time
+
+        self.serial = None
+
+        if port is not None:
 
             if not SERIAL_AVAILABLE:
 
                 raise RuntimeError(
-                    "pyserial is required for ITO control:\n"
+                    "Install pyserial:\n"
                     "python -m pip install pyserial"
                 )
 
-            self.connection = serial.Serial(
-                config.serial_port,
-                config.baudrate,
+            self.serial = serial.Serial(
+                port,
+                baudrate,
                 timeout=1
             )
 
             time.sleep(
-                config.settle_time
+                0.5
             )
 
     # --------------------------------------------------------
 
-    def load_pattern(
+    def generate_pattern(
         self,
-        path: str
+        rows: int,
+        cols: int,
+        pattern_type: str,
+        index: int = 0
     ) -> np.ndarray:
 
         """
-        Load a binary electrode pattern.
+        Generate a binary optical-electrode pattern.
 
-        Expected format:
+        Supported:
 
-            0 1 0 1
-            1 0 1 0
-            ...
-
-        Returns uint8 binary array.
+            single
+            checker
+            row
+            column
+            random
+            binary
+            diagonal
         """
 
-        values = []
-
-        with open(
-            path,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            for line in f:
-
-                line = line.strip()
-
-                if not line:
-
-                    continue
-
-                row = []
-
-                for token in (
-                    line
-                    .replace(",", " ")
-                    .split()
-                ):
-
-                    value = int(token)
-
-                    if value not in (0, 1):
-
-                        raise ValueError(
-                            "ITO pattern must contain "
-                            "only 0 or 1"
-                        )
-
-                    row.append(value)
-
-                if row:
-
-                    values.append(row)
-
-        if not values:
-
-            raise ValueError(
-                "ITO pattern is empty"
-            )
-
-        width = len(values[0])
-
-        if any(
-            len(row) != width
-            for row in values
-        ):
-
-            raise ValueError(
-                "ITO pattern rows have "
-                "different widths"
-            )
-
-        return np.asarray(
-            values,
+        pattern = np.zeros(
+            (
+                rows,
+                cols
+            ),
             dtype=np.uint8
         )
+
+        # ----------------------------------------------------
+        # SINGLE ACTIVE PIXEL
+        # ----------------------------------------------------
+
+        if pattern_type == "single":
+
+            r = (
+                index
+                //
+                cols
+            ) % rows
+
+            c = (
+                index
+                %
+                cols
+            )
+
+            pattern[r, c] = 1
+
+        # ----------------------------------------------------
+        # CHECKERBOARD
+        # ----------------------------------------------------
+
+        elif pattern_type == "checker":
+
+            for r in range(rows):
+
+                for c in range(cols):
+
+                    pattern[r, c] = (
+                        (r + c + index)
+                        & 1
+                    )
+
+        # ----------------------------------------------------
+        # ROW SCAN
+        # ----------------------------------------------------
+
+        elif pattern_type == "row":
+
+            r = index % rows
+
+            pattern[r, :] = 1
+
+        # ----------------------------------------------------
+        # COLUMN SCAN
+        # ----------------------------------------------------
+
+        elif pattern_type == "column":
+
+            c = index % cols
+
+            pattern[:, c] = 1
+
+        # ----------------------------------------------------
+        # RANDOM
+        # ----------------------------------------------------
+
+        elif pattern_type == "random":
+
+            rng = np.random.default_rng(
+                index
+            )
+
+            pattern[:] = rng.integers(
+                0,
+                2,
+                size=(
+                    rows,
+                    cols
+                ),
+                dtype=np.uint8
+            )
+
+        # ----------------------------------------------------
+        # BINARY INDEX PATTERN
+        # ----------------------------------------------------
+
+        elif pattern_type == "binary":
+
+            value = index
+
+            for p in range(
+                rows * cols
+            ):
+
+                bit = (
+                    value
+                    >>
+                    p
+                ) & 1
+
+                r = p // cols
+
+                c = p % cols
+
+                pattern[r, c] = bit
+
+        # ----------------------------------------------------
+        # DIAGONAL
+        # ----------------------------------------------------
+
+        elif pattern_type == "diagonal":
+
+            offset = index % (
+                rows + cols - 1
+            )
+
+            for r in range(rows):
+
+                c = offset - r
+
+                if 0 <= c < cols:
+
+                    pattern[r, c] = 1
+
+        else:
+
+            raise ValueError(
+                f"Unknown pattern: {pattern_type}"
+            )
+
+        return pattern
 
     # --------------------------------------------------------
 
@@ -438,12 +431,17 @@ class ITODevice:
         self,
         pattern: np.ndarray
     ):
-
         """
-        Send an electrode pattern to the controller.
+        Transmit a generated pattern.
 
-        Replace the packet format here with the actual
-        controller protocol.
+        Generic protocol:
+
+            BEGIN rows cols
+            010101...
+            101010...
+            END
+
+        Adapt this method to your actual ITO controller.
         """
 
         pattern = np.asarray(
@@ -451,273 +449,166 @@ class ITODevice:
             dtype=np.uint8
         )
 
-        if self.connection is None:
+        rows, cols = pattern.shape
+
+        if self.serial is None:
 
             print(
-                "ITO controller not connected; "
-                "pattern was loaded but not transmitted."
+                "ITO controller not connected."
+            )
+
+            print(
+                "Generated pattern:"
+            )
+
+            print(
+                pattern
+            )
+
+            print(
+                "Camera will measure the "
+                "currently physical optical state."
+            )
+
+            time.sleep(
+                self.settle_time
             )
 
             return
 
-        rows, cols = pattern.shape
+        # ----------------------------------------------------
+        # GENERIC SERIAL PROTOCOL
+        # ----------------------------------------------------
 
-        # Simple framed ASCII protocol:
-        #
-        # BEGIN rows cols
-        # row data
-        # ...
-        # END
-        #
-        # This is a generic interface, not a claim about
-        # the actual controller's firmware protocol.
+        header = (
+            f"BEGIN {rows} {cols}\n"
+        )
 
-        self.connection.write(
-            f"BEGIN {rows} {cols}\n".encode()
+        self.serial.write(
+            header.encode(
+                "ascii"
+            )
         )
 
         for row in pattern:
 
-            line = "".join(
+            bits = "".join(
                 "1" if x else "0"
                 for x in row
             )
 
-            self.connection.write(
-                (line + "\n").encode()
+            self.serial.write(
+                (
+                    bits
+                    +
+                    "\n"
+                ).encode(
+                    "ascii"
+                )
             )
 
-        self.connection.write(
+        self.serial.write(
             b"END\n"
         )
 
-        self.connection.flush()
+        self.serial.flush()
 
         time.sleep(
-            self.config.settle_time
+            self.settle_time
         )
 
     # --------------------------------------------------------
 
     def close(self):
 
-        if self.connection is not None:
+        if self.serial is not None:
 
-            self.connection.close()
+            self.serial.close()
 
-            self.connection = None
-
-
-# ============================================================
-# IMAGE UTILITIES
-# ============================================================
-
-def load_gray(
-    path: Optional[str]
-) -> Optional[np.ndarray]:
-
-    if path is None:
-
-        return None
-
-    image = cv2.imread(
-        path,
-        cv2.IMREAD_GRAYSCALE
-    )
-
-    if image is None:
-
-        raise FileNotFoundError(
-            path
-        )
-
-    return image.astype(
-        np.float32
-    )
+            self.serial = None
 
 
 # ============================================================
 # OPTICAL BENCH
 # ============================================================
 
-class RealOpticalBench:
-    """
-    Converts the physical camera measurement into a compact
-    optical mode vector.
-
-    The bench is NOT simulated.
-
-    The camera supplies the actual optical measurement.
-    """
+class OpticalBench:
 
     def __init__(
         self,
-        camera: RealOpticalCamera,
-        config: OpticalConfig
+        camera: OpticalCamera,
+        rows: int,
+        cols: int,
+        roi=None
     ):
 
         self.camera = camera
-        self.config = config
 
-        self.background = load_gray(
-            config.background_path
-        )
+        self.rows = rows
 
-        self.flat_field = load_gray(
-            config.flat_field_path
-        )
+        self.cols = cols
+
+        self.roi = roi
 
     # --------------------------------------------------------
 
-    @property
-    def mode_count(self) -> int:
-
-        return (
-            self.config.modes_x
-            *
-            self.config.modes_y
-        )
-
-    # --------------------------------------------------------
-
-    def crop_roi(
-        self,
-        frame: np.ndarray
-    ) -> np.ndarray:
-
-        if self.config.roi is None:
-
-            return frame
-
-        x, y, w, h = (
-            self.config.roi
-        )
-
-        if (
-            x < 0
-            or y < 0
-            or w <= 0
-            or h <= 0
-        ):
-
-            raise ValueError(
-                "ROI must be X Y WIDTH HEIGHT"
-            )
-
-        result = frame[
-            y:y + h,
-            x:x + w
-        ]
-
-        if result.size == 0:
-
-            raise ValueError(
-                "ROI is outside camera image"
-            )
-
-        return result
-
-    # --------------------------------------------------------
-
-    @staticmethod
-    def match(
-        image: np.ndarray,
-        shape: tuple[int, int]
-    ) -> np.ndarray:
-
-        image = np.asarray(
-            image,
-            dtype=np.float32
-        )
-
-        if image.shape == shape:
-
-            return image
-
-        return cv2.resize(
-            image,
-            (
-                shape[1],
-                shape[0]
-            ),
-            interpolation=cv2.INTER_LINEAR
-        )
-
-    # --------------------------------------------------------
-
-    def acquire_frame(
+    def acquire(
         self
-    ) -> np.ndarray:
+    ):
 
         frame = self.camera.read()
 
-        frame = self.crop_roi(
-            frame
-        )
+        if self.roi is not None:
 
-        if self.background is not None:
+            x, y, w, h = self.roi
 
-            bg = self.match(
-                self.background,
-                frame.shape
-            )
+            frame = frame[
+                y:y + h,
+                x:x + w
+            ]
 
-            frame = frame - bg
+            if frame.size == 0:
 
-        if self.flat_field is not None:
+                raise RuntimeError(
+                    "Optical ROI is empty"
+                )
 
-            ff = self.match(
-                self.flat_field,
-                frame.shape
-            )
-
-            frame = frame / np.maximum(
-                ff,
-                1.0
-            )
-
-        return np.maximum(
-            frame,
-            0.0
-        )
+        return frame
 
     # --------------------------------------------------------
 
-    def decode_modes(
+    def measure_modes(
         self,
-        frame: np.ndarray
-    ) -> np.ndarray:
+        frame
+    ):
 
         """
-        Spatially bin the physical camera image.
+        Reduce the camera image into a compact optical mode
+        grid.
 
-        The detector image is divided into modes_x x modes_y
-        regions.
-
-        Only the compact mode array is retained.
+        The large physical optical field is never reconstructed.
         """
-
-        rows = self.config.modes_y
-        cols = self.config.modes_x
 
         height, width = frame.shape
 
         modes = np.zeros(
             (
-                rows,
-                cols
+                self.rows,
+                self.cols
             ),
             dtype=np.float64
         )
 
-        for r in range(rows):
+        for r in range(
+            self.rows
+        ):
 
             y0 = (
                 r
                 *
                 height
                 //
-                rows
+                self.rows
             )
 
             y1 = (
@@ -725,17 +616,19 @@ class RealOpticalBench:
                 *
                 height
                 //
-                rows
+                self.rows
             )
 
-            for c in range(cols):
+            for c in range(
+                self.cols
+            ):
 
                 x0 = (
                     c
                     *
                     width
                     //
-                    cols
+                    self.cols
                 )
 
                 x1 = (
@@ -743,7 +636,7 @@ class RealOpticalBench:
                     *
                     width
                     //
-                    cols
+                    self.cols
                 )
 
                 region = frame[
@@ -756,37 +649,18 @@ class RealOpticalBench:
                     modes[
                         r,
                         c
-                    ] = float(
-                        region.mean()
-                    )
+                    ] = region.mean()
 
         return modes
 
-    # --------------------------------------------------------
-
-    def acquire_optical_modes(
-        self
-    ) -> tuple[
-        np.ndarray,
-        np.ndarray
-    ]:
-
-        frame = self.acquire_frame()
-
-        modes = self.decode_modes(
-            frame
-        )
-
-        return frame, modes
-
 
 # ============================================================
-# PRIME MODES
+# PRIME MASK
 # ============================================================
 
-def make_prime_mask(
+def prime_mask(
     n: int
-) -> np.ndarray:
+):
 
     mask = np.ones(
         n,
@@ -794,14 +668,21 @@ def make_prime_mask(
     )
 
     if n > 0:
+
         mask[0] = False
 
     if n > 1:
+
         mask[1] = False
 
     for p in range(
         2,
-        math.isqrt(n - 1) + 1
+        math.isqrt(
+            max(
+                1,
+                n - 1
+            )
+        ) + 1
     ):
 
         if mask[p]:
@@ -814,33 +695,30 @@ def make_prime_mask(
 
 
 # ============================================================
-# OPTICAL INTENSITY -> STATE
+# OPTICAL STATE
 # ============================================================
 
-def optical_intensity_to_state(
-    modes: np.ndarray,
-    prime_only: bool = False
-) -> tuple[
-    np.ndarray,
-    np.ndarray
-]:
+def make_optical_state(
+    modes,
+    prime_only=False
+):
 
     """
-    Convert measured optical intensities into a real
-    normalized quantum state.
+    Physical intensity:
 
-    For intensity I:
+        I
 
-        amplitude = sqrt(I)
+    Optical amplitude:
 
-    because:
+        sqrt(I)
 
-        probability = |amplitude|^2
+    Quantum probability:
 
-    No optical phase is invented.
+        |psi|^2
 
-    The resulting state is therefore the intensity-derived
-    real-amplitude state.
+    Therefore:
+
+        psi_i = sqrt(I_i / sum(I))
     """
 
     intensity = np.asarray(
@@ -850,26 +728,21 @@ def optical_intensity_to_state(
 
     intensity = np.maximum(
         intensity,
-        0.0
+        0
     )
 
     if prime_only:
 
-        mask = make_prime_mask(
+        intensity *= prime_mask(
             len(intensity)
         )
 
-        intensity *= mask
-
-    total = float(
-        intensity.sum()
-    )
+    total = intensity.sum()
 
     if total <= 0:
 
         raise RuntimeError(
-            "The optical bench produced "
-            "zero usable intensity."
+            "No optical intensity available."
         )
 
     probabilities = (
@@ -882,11 +755,9 @@ def optical_intensity_to_state(
         probabilities
     )
 
-    norm = np.linalg.norm(
+    amplitudes /= np.linalg.norm(
         amplitudes
     )
-
-    amplitudes /= norm
 
     return (
         amplitudes,
@@ -895,49 +766,32 @@ def optical_intensity_to_state(
 
 
 # ============================================================
-# QISKIT
+# QISKIT BACKEND
 # ============================================================
 
-class OpticalQiskitBackend:
-    """
-    Qiskit receives ONLY the compact optical state.
-
-    For 32 x 32 modes:
-
-        1024 amplitudes
-        10 qubits
-
-    This is tiny compared with the original physical
-    optical plane.
-    """
+class QiskitOpticalBackend:
 
     def __init__(
         self,
-        modes: int
+        modes
     ):
 
         if not QISKIT_AVAILABLE:
 
             raise RuntimeError(
-                "Install Qiskit with:\n"
+                "Install Qiskit:\n"
                 "python -m pip install -U qiskit"
-            )
-
-        if modes <= 0:
-
-            raise ValueError(
-                "Mode count must be positive."
             )
 
         if (
             modes
             &
             (modes - 1)
-        ) != 0:
+        ):
 
             raise ValueError(
-                "Mode count must be a power of two "
-                "for direct computational-basis mapping."
+                "Number of optical modes must "
+                "be a power of two."
             )
 
         self.modes = modes
@@ -949,10 +803,10 @@ class OpticalQiskitBackend:
 
     # --------------------------------------------------------
 
-    def prepare_state(
+    def circuit(
         self,
-        amplitudes: np.ndarray
-    ) -> QuantumCircuit:
+        amplitudes
+    ):
 
         amplitudes = np.asarray(
             amplitudes,
@@ -962,77 +816,63 @@ class OpticalQiskitBackend:
         if len(amplitudes) != self.modes:
 
             raise ValueError(
-                "Optical state has incorrect size."
+                "State size does not match "
+                "optical mode count."
             )
 
-        norm = np.linalg.norm(
-            amplitudes
-        )
-
-        if norm <= 0:
-
-            raise ValueError(
-                "Optical state has zero norm."
-            )
-
-        amplitudes = (
-            amplitudes
-            /
-            norm
-        )
-
-        circuit = QuantumCircuit(
+        qc = QuantumCircuit(
             self.qubits,
-            self.qubits,
-            name="REAL_OPTICAL_STATE"
+            self.qubits
         )
 
-        # Only the compact optical state is transferred.
-        #
-        # For 1024 modes this is a 1024-element state.
-        #
-        # It is NOT the 32768 x 32768 physical optical plane.
-
-        circuit.initialize(
+        # Optical bench -> Qiskit state.
+        qc.initialize(
             amplitudes.tolist(),
-            range(self.qubits)
+            range(
+                self.qubits
+            )
         )
 
-        circuit.barrier(
+        qc.barrier(
             label="OPTICAL_BENCH"
         )
 
-        circuit.measure(
-            range(self.qubits),
-            range(self.qubits)
+        qc.measure(
+            range(
+                self.qubits
+            ),
+            range(
+                self.qubits
+            )
         )
 
-        return circuit
+        return qc
 
     # --------------------------------------------------------
 
     def sample(
         self,
-        amplitudes: np.ndarray,
-        shots: int,
-        seed: int
-    ) -> dict[str, int]:
+        amplitudes,
+        shots,
+        seed
+    ):
 
         """
-        Sample the compact optical state.
+        Sample directly from the compact state.
 
-        Qiskit's Statevector is only 1024 elements for the
-        default 32x32 optical mode plane.
+        This avoids constructing any large physical optical
+        matrix.
+
+        For 1024 modes:
+
+            1024 probabilities
+            10 logical qubits
         """
-
-        amplitudes = np.asarray(
-            amplitudes,
-            dtype=np.complex128
-        )
 
         probabilities = (
-            np.abs(amplitudes)
-            ** 2
+            np.abs(
+                amplitudes
+            ) ** 2
         )
 
         probabilities /= (
@@ -1043,20 +883,22 @@ class OpticalQiskitBackend:
             seed
         )
 
-        selected = rng.choice(
+        values = rng.choice(
             self.modes,
             size=shots,
             p=probabilities
         )
 
-        counts: dict[str, int] = {}
+        counts = {}
 
-        for mode in selected:
+        for value in values:
 
-            mode = int(mode)
+            value = int(
+                value
+            )
 
             bits = format(
-                mode,
+                value,
                 f"0{self.qubits}b"
             )
 
@@ -1075,18 +917,19 @@ class OpticalQiskitBackend:
 # SAVE
 # ============================================================
 
-def save_results(
-    output_dir: str,
-    frame: np.ndarray,
-    modes: np.ndarray,
-    amplitudes: np.ndarray,
-    probabilities: np.ndarray,
-    counts: dict[str, int],
-    circuit: QuantumCircuit
+def save_run(
+    output,
+    pattern,
+    frame,
+    modes,
+    amplitudes,
+    probabilities,
+    counts,
+    circuit
 ):
 
     out = Path(
-        output_dir
+        output
     )
 
     out.mkdir(
@@ -1094,10 +937,17 @@ def save_results(
         exist_ok=True
     )
 
+    np.savetxt(
+        out / "ito_pattern.csv",
+        pattern,
+        fmt="%d",
+        delimiter=","
+    )
+
     cv2.imwrite(
         str(
             out /
-            "real_optical_camera_frame.png"
+            "optical_camera_frame.png"
         ),
         np.clip(
             frame,
@@ -1110,15 +960,15 @@ def save_results(
 
     np.savetxt(
         out /
-        "measured_optical_modes.csv",
+        "optical_modes.csv",
         modes,
-        delimiter=",",
-        fmt="%.10g"
+        fmt="%.10g",
+        delimiter=","
     )
 
     np.save(
         out /
-        "optical_state_amplitudes.npy",
+        "optical_state.npy",
         amplitudes
     )
 
@@ -1147,20 +997,16 @@ def save_results(
         encoding="utf-8"
     ) as f:
 
-        writer = csv.writer(f)
+        writer = csv.writer(
+            f
+        )
 
         writer.writerow(
             [
                 "bitstring",
                 "mode",
-                "count",
-                "probability"
+                "count"
             ]
-        )
-
-        total = max(
-            sum(counts.values()),
-            1
         )
 
         for bits, count in sorted(
@@ -1173,144 +1019,9 @@ def save_results(
                 [
                     bits,
                     int(bits, 2),
-                    count,
-                    count / total
+                    count
                 ]
             )
-
-
-# ============================================================
-# REPORT
-# ============================================================
-
-def report(
-    optical_config: OpticalConfig,
-    modes: np.ndarray,
-    amplitudes: np.ndarray,
-    probabilities: np.ndarray,
-    counts: dict[str, int],
-    qiskit_backend: OpticalQiskitBackend,
-    elapsed: float
-):
-
-    print()
-    print("=" * 72)
-    print("REAL OPTICAL BENCH")
-    print("=" * 72)
-
-    print(
-        "Polariser             : NONE"
-    )
-
-    print(
-        "Optical source        : REAL"
-    )
-
-    print(
-        "ITO device            : REAL HARDWARE INPUT"
-    )
-
-    print(
-        "Camera                : REAL"
-    )
-
-    print(
-        f"Optical modes         : "
-        f"{optical_config.modes_x} x "
-        f"{optical_config.modes_y}"
-    )
-
-    print(
-        f"Total modes           : "
-        f"{len(amplitudes)}"
-    )
-
-    print(
-        f"Logical qubits        : "
-        f"{qiskit_backend.qubits}"
-    )
-
-    print()
-    print(
-        "Physical optical plane"
-    )
-
-    print(
-        "    remains outside the Qiskit state."
-    )
-
-    print()
-    print(
-        "Measured optical matrix:"
-    )
-
-    print(
-        modes
-    )
-
-    print()
-    print(
-        "Optical state norm:"
-    )
-
-    print(
-        f"    {np.linalg.norm(amplitudes):.12f}"
-    )
-
-    print()
-    print(
-        "Optical acquisition time:"
-    )
-
-    print(
-        f"    {elapsed:.4f} seconds"
-    )
-
-    print()
-    print("=" * 72)
-    print("TOP OPTICAL MODES")
-    print("=" * 72)
-
-    flat = probabilities.reshape(-1)
-
-    top = np.argsort(
-        flat
-    )[::-1][:32]
-
-    for mode in top:
-
-        bits = format(
-            int(mode),
-            f"0{qiskit_backend.qubits}b"
-        )
-
-        print(
-            f"mode={mode:4d} "
-            f"|{bits}> "
-            f"p={flat[mode]:.8f}"
-        )
-
-    print()
-    print("=" * 72)
-    print("QISKIT READOUT")
-    print("=" * 72)
-
-    total = max(
-        sum(counts.values()),
-        1
-    )
-
-    for bits, count in sorted(
-        counts.items(),
-        key=lambda x: x[1],
-        reverse=True
-    )[:32]:
-
-        print(
-            f"|{bits}> "
-            f"count={count:6d} "
-            f"p={count / total:.8f}"
-        )
 
 
 # ============================================================
@@ -1321,10 +1032,15 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Real optical bench "
-            "feeding a compact Qiskit state."
+            "Automatically generate ITO patterns, "
+            "measure the real optical bench, "
+            "and construct a Qiskit state."
         )
     )
+
+    # --------------------------------------------------------
+    # CAMERA
+    # --------------------------------------------------------
 
     parser.add_argument(
         "--camera",
@@ -1356,17 +1072,9 @@ def main():
         default=None
     )
 
-    parser.add_argument(
-        "--roi",
-        type=int,
-        nargs=4,
-        metavar=(
-            "X",
-            "Y",
-            "WIDTH",
-            "HEIGHT"
-        )
-    )
+    # --------------------------------------------------------
+    # OPTICAL GRID
+    # --------------------------------------------------------
 
     parser.add_argument(
         "--modes-x",
@@ -1379,6 +1087,78 @@ def main():
         type=int,
         default=32
     )
+
+    parser.add_argument(
+        "--roi",
+        type=int,
+        nargs=4,
+        metavar=(
+            "X",
+            "Y",
+            "WIDTH",
+            "HEIGHT"
+        )
+    )
+
+    # --------------------------------------------------------
+    # PATTERN GENERATION
+    # --------------------------------------------------------
+
+    parser.add_argument(
+        "--pattern",
+        choices=[
+            "single",
+            "checker",
+            "row",
+            "column",
+            "random",
+            "binary",
+            "diagonal"
+        ],
+        default="single"
+    )
+
+    parser.add_argument(
+        "--pattern-index",
+        type=int,
+        default=0
+    )
+
+    parser.add_argument(
+        "--sweep",
+        type=int,
+        default=1,
+        help=(
+            "Number of automatically generated "
+            "ITO patterns to measure."
+        )
+    )
+
+    # --------------------------------------------------------
+    # ITO
+    # --------------------------------------------------------
+
+    parser.add_argument(
+        "--serial",
+        default=None,
+        help="ITO controller port, e.g. COM3"
+    )
+
+    parser.add_argument(
+        "--baudrate",
+        type=int,
+        default=115200
+    )
+
+    parser.add_argument(
+        "--settle",
+        type=float,
+        default=0.05
+    )
+
+    # --------------------------------------------------------
+    # QISKIT
+    # --------------------------------------------------------
 
     parser.add_argument(
         "--shots",
@@ -1398,157 +1178,189 @@ def main():
     )
 
     parser.add_argument(
-        "--background",
-        default=None
-    )
-
-    parser.add_argument(
-        "--flat-field",
-        default=None
-    )
-
-    parser.add_argument(
-        "--serial",
-        default=None,
-        help="ITO controller serial port, e.g. COM3"
-    )
-
-    parser.add_argument(
-        "--baudrate",
-        type=int,
-        default=115200
-    )
-
-    parser.add_argument(
-        "--pattern",
-        default=None,
-        help="Binary ITO electrode pattern"
-    )
-
-    parser.add_argument(
-        "--settle",
-        type=float,
-        default=0.05
-    )
-
-    parser.add_argument(
         "--output",
         default="optical_output"
     )
 
     args = parser.parse_args()
 
-    if not QISKIT_AVAILABLE:
+    # --------------------------------------------------------
+    # VALIDATION
+    # --------------------------------------------------------
 
-        raise RuntimeError(
-            "Qiskit is not installed.\n\n"
-            "Install it with:\n"
-            "python -m pip install -U qiskit"
-        )
-
-    mode_count = (
+    modes = (
         args.modes_x
         *
         args.modes_y
     )
 
     if (
-        mode_count
+        modes
         &
-        (mode_count - 1)
-    ) != 0:
+        (modes - 1)
+    ):
 
         raise ValueError(
-            "modes_x * modes_y must be a power of two."
+            f"{args.modes_x} x {args.modes_y} = "
+            f"{modes}; total modes must be a power of two."
         )
 
-    camera_config = CameraConfig(
-        camera_index=args.camera,
-        width=args.camera_width,
-        height=args.camera_height,
-        exposure=args.exposure,
-        gain=args.gain
+    # --------------------------------------------------------
+    # HARDWARE
+    # --------------------------------------------------------
+
+    camera = OpticalCamera(
+        CameraConfig(
+            index=args.camera,
+            width=args.camera_width,
+            height=args.camera_height,
+            exposure=args.exposure,
+            gain=args.gain
+        )
     )
 
-    optical_config = OpticalConfig(
-        modes_x=args.modes_x,
-        modes_y=args.modes_y,
+    ito = ITOController(
+        port=args.serial,
+        baudrate=args.baudrate,
+        settle_time=args.settle
+    )
+
+    bench = OpticalBench(
+        camera=camera,
+        rows=args.modes_y,
+        cols=args.modes_x,
         roi=(
             tuple(args.roi)
             if args.roi
             else None
-        ),
-        background_path=args.background,
-        flat_field_path=args.flat_field,
-        prime_only=args.prime_only,
-        output_dir=args.output
+        )
     )
 
-    ito_config = ITOConfig(
-        serial_port=args.serial,
-        baudrate=args.baudrate,
-        pattern_path=args.pattern,
-        settle_time=args.settle
-    )
-
-    camera = RealOpticalCamera(
-        camera_config
-    )
-
-    ito = ITODevice(
-        ito_config
+    qiskit_backend = (
+        QiskitOpticalBackend(
+            modes
+        )
     )
 
     try:
 
+        accumulated = np.zeros(
+            modes,
+            dtype=np.float64
+        )
+
+        print()
+        print("=" * 72)
+        print("AUTOMATIC REAL OPTICAL BENCH")
+        print("=" * 72)
+
+        print(
+            f"ITO plane              : "
+            f"{args.modes_y} x {args.modes_x}"
+        )
+
+        print(
+            f"Optical modes          : "
+            f"{modes}"
+        )
+
+        print(
+            f"Logical Qiskit qubits  : "
+            f"{qiskit_backend.qubits}"
+        )
+
+        print(
+            "Polariser              : NONE"
+        )
+
+        print(
+            "Synthetic optical data: NONE"
+        )
+
+        print()
+
         # ----------------------------------------------------
-        # DRIVE REAL ITO DEVICE
+        # AUTOMATIC PATTERN / MEASUREMENT LOOP
         # ----------------------------------------------------
 
-        if args.pattern is not None:
+        for sweep_index in range(
+            args.sweep
+        ):
 
-            pattern = ito.load_pattern(
-                args.pattern
+            pattern = ito.generate_pattern(
+                rows=args.modes_y,
+                cols=args.modes_x,
+                pattern_type=args.pattern,
+                index=(
+                    args.pattern_index
+                    +
+                    sweep_index
+                )
             )
 
             print(
-                f"Loaded physical ITO pattern: "
-                f"{pattern.shape[0]} x "
-                f"{pattern.shape[1]}"
+                f"[{sweep_index + 1}/{args.sweep}] "
+                f"Generating ITO pattern..."
             )
 
+            # Physical electrical operation.
             ito.send_pattern(
                 pattern
+            )
+
+            print(
+                "    Waiting for physical "
+                "optical response..."
             )
 
             time.sleep(
                 args.settle
             )
 
+            # ------------------------------------------------
+            # REAL OPTICAL MEASUREMENT
+            # ------------------------------------------------
+
+            frame = bench.acquire()
+
+            measured = (
+                bench.measure_modes(
+                    frame
+                )
+            )
+
+            flat = measured.reshape(
+                -1
+            )
+
+            accumulated += flat
+
+            print(
+                f"    Camera measurement: "
+                f"{flat.shape[0]} modes"
+            )
+
+            print(
+                f"    Total optical power: "
+                f"{flat.sum():.6g}"
+            )
+
         # ----------------------------------------------------
-        # REAL OPTICAL ACQUISITION
+        # AVERAGE OPTICAL RESPONSE
         # ----------------------------------------------------
 
-        bench = RealOpticalBench(
-            camera,
-            optical_config
+        measured_modes = (
+            accumulated
+            /
+            max(
+                args.sweep,
+                1
+            )
         )
 
-        print()
-        print(
-            "Acquiring REAL optical field..."
-        )
-
-        start = time.perf_counter()
-
-        frame, modes = (
-            bench.acquire_optical_modes()
-        )
-
-        elapsed = (
-            time.perf_counter()
-            -
-            start
+        measured_modes = measured_modes.reshape(
+            args.modes_y,
+            args.modes_x
         )
 
         # ----------------------------------------------------
@@ -1556,8 +1368,8 @@ def main():
         # ----------------------------------------------------
 
         amplitudes, probabilities = (
-            optical_intensity_to_state(
-                modes,
+            make_optical_state(
+                measured_modes,
                 prime_only=args.prime_only
             )
         )
@@ -1566,14 +1378,8 @@ def main():
         # QISKIT
         # ----------------------------------------------------
 
-        qiskit_backend = (
-            OpticalQiskitBackend(
-                mode_count
-            )
-        )
-
         circuit = (
-            qiskit_backend.prepare_state(
+            qiskit_backend.circuit(
                 amplitudes
             )
         )
@@ -1590,24 +1396,89 @@ def main():
         # REPORT
         # ----------------------------------------------------
 
-        report(
-            optical_config,
-            modes,
-            amplitudes,
-            probabilities,
-            counts,
-            qiskit_backend,
-            elapsed
+        print()
+        print("=" * 72)
+        print("OPTICAL STATE")
+        print("=" * 72)
+
+        print(
+            f"Amplitude elements : "
+            f"{len(amplitudes)}"
         )
+
+        print(
+            f"Logical qubits     : "
+            f"{qiskit_backend.qubits}"
+        )
+
+        print(
+            f"State norm         : "
+            f"{np.linalg.norm(amplitudes):.12f}"
+        )
+
+        print(
+            f"Probability sum    : "
+            f"{probabilities.sum():.12f}"
+        )
+
+        print()
+
+        print(
+            "Top optical modes:"
+        )
+
+        top = np.argsort(
+            probabilities
+        )[::-1][:32]
+
+        for mode in top:
+
+            bits = format(
+                int(mode),
+                f"0{qiskit_backend.qubits}b"
+            )
+
+            print(
+                f"mode={mode:5d} "
+                f"|{bits}> "
+                f"p={probabilities[mode]:.8f}"
+            )
+
+        # ----------------------------------------------------
+        # QISKIT RESULTS
+        # ----------------------------------------------------
+
+        print()
+        print("=" * 72)
+        print("QISKIT RESULTS")
+        print("=" * 72)
+
+        total = max(
+            sum(counts.values()),
+            1
+        )
+
+        for bits, count in sorted(
+            counts.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )[:32]:
+
+            print(
+                f"|{bits}> "
+                f"count={count:6d} "
+                f"p={count / total:.8f}"
+            )
 
         # ----------------------------------------------------
         # SAVE
         # ----------------------------------------------------
 
-        save_results(
+        save_run(
             args.output,
+            pattern,
             frame,
-            modes,
+            measured_modes,
             amplitudes,
             probabilities,
             counts,
@@ -1616,14 +1487,23 @@ def main():
 
         print()
         print(
-            f"Saved results to: {args.output}"
+            "=" * 72
+        )
+
+        print(
+            f"Results saved to: {args.output}"
         )
 
     finally:
 
-        camera.close()
         ito.close()
 
+        camera.close()
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
 
