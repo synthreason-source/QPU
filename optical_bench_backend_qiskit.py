@@ -810,23 +810,8 @@ def run(
     print(
         "OPTICAL PRIME STATEVECTOR"
     )
+
     print("=" * 80)
-
-    print(
-        "Optical plane:",
-        "256 x 256"
-    )
-
-    print(
-        "Optical modes:",
-        "65,536"
-    )
-
-    print(
-        "Qiskit qubits:",
-        "16"
-    )
-
     # --------------------------------------------------------
     # OPTICAL MULTIPLICATION
     # --------------------------------------------------------
