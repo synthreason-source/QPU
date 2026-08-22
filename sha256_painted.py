@@ -36,7 +36,7 @@ def bruteforce_nonce_with_hash(base_hex: str,
                 print(c, hex_str)
 
                 return x, hex_str
-
+        print(c,"/",max_counter,hex_str)
     return None, None
 
 
@@ -46,7 +46,7 @@ total_width = 64
 # Bruteforce to find the nonce by hashing with each counter
 found_nonce, found_hex = bruteforce_nonce_with_hash(
     base,
-    max_counter=0x1000000,
+    max_counter=0x100000,
     total_width=total_width,
 )
 
