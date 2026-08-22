@@ -185,4 +185,4 @@ def print_result(result: dict):
 if __name__ == "__main__":
     # 20 bits ~= 1 in 1,048,576 odds per attempt - fast enough to run live,
     # slow enough to give a stable hashrate measurement.
-    run_comparison(target_bits=24, max_counter=20_000_000_000)
+    run_comparison(target_bits=28, max_counter=20_000_000_000)
