@@ -34,7 +34,7 @@ def bruteforce_nonce_with_hash(base_hex: str,
             # Check if this counter (nonce) reproduces the target hash
             if digest == hex_str:
                 print(c, hex_str)
-
+                
                 return x, hex_str
         print(c,"/",max_counter,hex_str)
     return None, None
