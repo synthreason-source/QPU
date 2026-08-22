@@ -1,129 +1,353 @@
 /*
- * OpticalComputing_HardwareBackend.ino
- * ===================================
- * Arduino firmware companion for optical_binary.py.
- *
- * Drives each light valve from its own Arduino digital output pin
- * (no shift registers). Simple and direct, but the valve count is
- * now hard-capped at however many GPIO pins you list in VALVE_PINS[]
- * -- typically ~10-20 on an Uno/Nano/Mega depending on what else you
- * need. If you outgrow your available pins, you'd need to go back to
- * a shift-register chain (or an I/O expander) instead.
- *
- * Valve state convention: bit = 1 -> valve OPEN, bit = 0 -> valve
- * CLOSED. Invert here (or in your driver stage) if yours is active-low.
- *
- * Framing protocol (must match optical_binary.py):
- *   Host -> MCU:  "FRAME:<N>\n"   ASCII header, N = number of payload bytes
- *                 <N raw bytes>    packed bit data, MSB-first per byte
- *   MCU  -> Host: "ACK\n"          once every valve pin has been set
- *
- * The header is read as a text line (safe -- pure ASCII, always ends
- * in exactly one '\n'). The payload that follows is read as a fixed
- * byte count, NOT scanned for '\n', so binary data can contain any
- * byte value without breaking framing.
- *
- * Only the first NUM_VALVES bits of the incoming payload are applied
- * (one bit per pin, MSB-first per byte, in VALVE_PINS[] order). Any
- * extra bits beyond NUM_VALVES are still read off the wire (to stay
- * in sync with the host) but ignored.
- */
+  ITO 32x32 Optical Bench Controller
 
-// --- One pin per valve. Edit this list to match your wiring. ---
-const int VALVE_PINS[] = {2, 3, 4, 5, 6, 7, 8, 9};
-const int NUM_VALVES = sizeof(VALVE_PINS) / sizeof(VALVE_PINS[0]);
-const int NUM_PAYLOAD_BYTES = (NUM_VALVES + 7) / 8; // ceil(NUM_VALVES / 8)
+  Receives from Python:
 
-const int SENSOR_PIN = A0;  // Analog pin connected to the optical sensor/photodiode
-const long BAUD_RATE = 115200;
+      BEGIN 32 32
+      010101...
+      101010...
+      ...
+      END
 
-const unsigned long BYTE_TIMEOUT_MS = 2000; // per-byte read timeout while receiving a frame
+  The received binary pattern is held on the Arduino.
 
-// Small fixed buffer, bounded by NUM_VALVES (not by frame size), so
-// we can apply all valve pins together for an atomic-looking update.
-uint8_t frameBuffer[(NUM_VALVES + 7) / 8];
+  IMPORTANT:
+  This sketch contains the SERIAL PROTOCOL and a hardware
+  abstraction for the ITO outputs.
 
-void setup() {
-  Serial.begin(BAUD_RATE);
-  Serial.setTimeout(BYTE_TIMEOUT_MS);
-  while (!Serial); // Wait for serial port to connect (native USB boards)
+  You MUST adapt setITOCell() to the actual electronics
+  driving your ITO glass.
 
-  pinMode(SENSOR_PIN, INPUT);
+  The ITO glass itself should NOT be driven directly from
+  Arduino GPIO pins.
+*/
 
-  // Every valve starts CLOSED -- known, safe state before anything
-  // else happens.
-  for (int i = 0; i < NUM_VALVES; i++) {
-    pinMode(VALVE_PINS[i], OUTPUT);
-    digitalWrite(VALVE_PINS[i], LOW);
-  }
+#include <Arduino.h>
+
+#define ROWS 32
+#define COLS 32
+
+// ------------------------------------------------------------
+// Current optical pattern
+// ------------------------------------------------------------
+
+uint8_t pattern[ROWS][COLS];
+
+bool receivingPattern = false;
+
+int currentRow = 0;
+
+int expectedRows = 0;
+int expectedCols = 0;
+
+
+// ------------------------------------------------------------
+// INITIALISE
+// ------------------------------------------------------------
+
+void setup()
+{
+    Serial.begin(115200);
+
+    memset(
+        pattern,
+        0,
+        sizeof(pattern)
+    );
+
+    /*
+      Configure your actual ITO driver hardware here.
+
+      Examples:
+
+        shift registers
+        SPI DACs
+        analogue multiplexers
+        row/column drivers
+        external GPIO expanders
+        DAC channels
+
+      Do NOT connect a 50 mm ITO electrode directly
+      to an Arduino pin if the electrical requirements
+      exceed the Arduino's GPIO specifications.
+    */
+
+    initialiseITOHardware();
+
+    Serial.println("ITO_READY");
 }
 
-// Reads exactly `count` raw bytes off the wire. The first
-// NUM_PAYLOAD_BYTES of them are kept in frameBuffer; anything beyond
-// that is still read (to stay in sync with the host) but discarded.
-// Returns true on success, false on timeout/short read.
-bool receiveFrame(long count) {
-  for (long i = 0; i < count; i++) {
-    unsigned long waitStart = millis();
-    while (Serial.available() == 0) {
-      if (millis() - waitStart > BYTE_TIMEOUT_MS) {
-        return false;
-      }
+
+// ------------------------------------------------------------
+// MAIN LOOP
+// ------------------------------------------------------------
+
+void loop()
+{
+    if (Serial.available())
+    {
+        String line = Serial.readStringUntil('\n');
+
+        line.trim();
+
+        if (line.length() == 0)
+            return;
+
+        processLine(line);
     }
-    int b = Serial.read();
-    if (b < 0) return false;
-
-    if (i < NUM_PAYLOAD_BYTES) {
-      frameBuffer[i] = (uint8_t)b;
-    }
-    // else: extra byte beyond what we can use -- drained, not stored
-  }
-  return true;
 }
 
-// Applies frameBuffer to the actual valve pins: one bit per valve,
-// MSB-first per byte, in VALVE_PINS[] order. This is the moment the
-// physical valves change state.
-void applyValvesFromBuffer() {
-  for (int v = 0; v < NUM_VALVES; v++) {
-    int byteIdx = v / 8;
-    int bitIdx  = 7 - (v % 8); // MSB-first, matches np.packbits(bitorder="big")
-    bool open = (frameBuffer[byteIdx] >> bitIdx) & 0x01;
-    digitalWrite(VALVE_PINS[v], open ? HIGH : LOW);
-  }
-}
 
-void loop() {
-  if (Serial.available() > 0) {
-    // Header format: "FRAME:<N>\n" -- safe to read as a line since it's
-    // plain ASCII and always terminates in exactly one newline. Only
-    // the payload that follows is binary, and that's read as an exact
-    // byte count below, never scanned for '\n'.
-    String command = Serial.readStringUntil('\n');
-    command.trim();
+// ------------------------------------------------------------
+// SERIAL PROTOCOL
+// ------------------------------------------------------------
 
-    if (command.startsWith("FRAME:")) {
-      int colonIdx = command.indexOf(':');
-      long payloadLen = command.substring(colonIdx + 1).toInt();
-      if (payloadLen <= 0) {
-        Serial.println("ERR:BAD_LENGTH");
-      } else {
-        bool ok = receiveFrame(payloadLen);
-        if (!ok) {
-          Serial.println("ERR:TIMEOUT");
-        } else {
-          applyValvesFromBuffer(); // this is the actual valve actuation moment
-          Serial.println("ACK");
+void processLine(String &line)
+{
+    // --------------------------------------------------------
+    // BEGIN
+    // --------------------------------------------------------
+
+    if (line.startsWith("BEGIN"))
+    {
+        int firstSpace =
+            line.indexOf(' ');
+
+        int secondSpace =
+            line.indexOf(
+                ' ',
+                firstSpace + 1
+            );
+
+        if (
+            firstSpace < 0 ||
+            secondSpace < 0
+        )
+        {
+            Serial.println("ERROR BEGIN");
+            return;
         }
-      }
-    }
-    else if (command == "TRIGGER_EXPOSURE") {
-      // Read optical intensity from the physical sensor
-      int sensorValue = analogRead(SENSOR_PIN);
-      float intensity = (float)sensorValue / 1023.0 * 5.0;
 
-      Serial.print("INTENSITY:");
-      Serial.println(intensity, 4);
+        expectedRows =
+            line.substring(
+                firstSpace + 1,
+                secondSpace
+            ).toInt();
+
+        expectedCols =
+            line.substring(
+                secondSpace + 1
+            ).toInt();
+
+        if (
+            expectedRows != ROWS ||
+            expectedCols != COLS
+        )
+        {
+            Serial.println("ERROR DIMENSIONS");
+            receivingPattern = false;
+            return;
+        }
+
+        currentRow = 0;
+
+        receivingPattern = true;
+
+        Serial.println("BEGIN_OK");
+
+        return;
     }
-  }
+
+
+    // --------------------------------------------------------
+    // END
+    // --------------------------------------------------------
+
+    if (line == "END")
+    {
+        if (!receivingPattern)
+        {
+            Serial.println("ERROR NO_PATTERN");
+            return;
+        }
+
+        if (currentRow != ROWS)
+        {
+            Serial.println("ERROR ROW_COUNT");
+            receivingPattern = false;
+            return;
+        }
+
+        receivingPattern = false;
+
+        applyITO();
+
+        Serial.println("ITO_APPLIED");
+
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // PATTERN ROW
+    // --------------------------------------------------------
+
+    if (receivingPattern)
+    {
+        if (currentRow >= ROWS)
+        {
+            Serial.println("ERROR TOO_MANY_ROWS");
+            return;
+        }
+
+        if (line.length() != COLS)
+        {
+            Serial.println("ERROR ROW_LENGTH");
+            receivingPattern = false;
+            return;
+        }
+
+        for (int c = 0; c < COLS; c++)
+        {
+            char value = line.charAt(c);
+
+            if (value == '0')
+            {
+                pattern[currentRow][c] = 0;
+            }
+            else if (value == '1')
+            {
+                pattern[currentRow][c] = 1;
+            }
+            else
+            {
+                Serial.println("ERROR INVALID_BIT");
+                receivingPattern = false;
+                return;
+            }
+        }
+
+        currentRow++;
+
+        return;
+    }
+
+    Serial.println("ERROR UNKNOWN_COMMAND");
+}
+
+
+// ------------------------------------------------------------
+// APPLY COMPLETE PATTERN
+// ------------------------------------------------------------
+
+void applyITO()
+{
+    /*
+      This is deliberately separated from the serial receiver.
+
+      At this point:
+
+          pattern[r][c]
+
+      contains the entire desired electrode configuration.
+
+      The actual implementation depends on your ITO driver.
+    */
+
+    for (int r = 0; r < ROWS; r++)
+    {
+        for (int c = 0; c < COLS; c++)
+        {
+            setITOCell(
+                r,
+                c,
+                pattern[r][c]
+            );
+        }
+    }
+}
+
+
+// ------------------------------------------------------------
+// HARDWARE INITIALISATION
+// ------------------------------------------------------------
+
+void initialiseITOHardware()
+{
+    /*
+      Put your actual driver initialisation here.
+
+      Example:
+
+          SPI.begin();
+
+      or configure GPIO expanders / multiplexers / DACs.
+
+      This example intentionally does not assume a particular
+      electrical topology.
+    */
+}
+
+
+// ------------------------------------------------------------
+// ITO CELL DRIVER
+// ------------------------------------------------------------
+
+void setITOCell(
+    int row,
+    int col,
+    uint8_t state
+)
+{
+    /*
+      HARDWARE-SPECIFIC SECTION.
+
+      state == 0
+          electrode OFF
+
+      state == 1
+          electrode ON
+
+      Replace this with the actual circuit controlling your
+      ITO electrodes.
+
+      For example, if you use external row/column drivers:
+
+          selectRow(row);
+          selectColumn(col);
+          setVoltage(state);
+
+      Do NOT simply use:
+
+          digitalWrite(row, state);
+
+      unless your actual hardware has been designed so that
+      this is electrically appropriate.
+    */
+
+    // Placeholder.
+    //
+    // Your real ITO driver goes here.
+}
+
+
+// ------------------------------------------------------------
+// OPTIONAL CLEAR
+// ------------------------------------------------------------
+
+void clearITO()
+{
+    for (int r = 0; r < ROWS; r++)
+    {
+        for (int c = 0; c < COLS; c++)
+        {
+            pattern[r][c] = 0;
+
+            setITOCell(
+                r,
+                c,
+                0
+            );
+        }
+    }
 }
