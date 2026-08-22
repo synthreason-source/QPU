@@ -22,7 +22,7 @@ def bruteforce_nonce_with_hash(base_hex: str,
     Bruteforce search for a counter (nonce) such that:
       SHA256(bytes_from_hex(make_padded_hex_with_counter(base_hex, counter))) == target_hash_hex
     """
-    for c in range(max_counter):
+    for c in range(100000000000000000000000000,1000000000000000000000000000):
         for x in range(max_counter):
             # Build hex string with this counter
             hex_str = make_padded_hex_with_counter(base_hex, c, total_width)
@@ -36,7 +36,7 @@ def bruteforce_nonce_with_hash(base_hex: str,
                 print(c, hex_str)
                 
                 return x, hex_str
-        print(c,"/",max_counter,hex_str)
+        print(c,"/",max_counter**2,hex_str)
     return None, None
 
 
@@ -65,5 +65,5 @@ else:
     print("Reconstructed hex string:")
     print(found_hex)
     print("target_hash_hex:", target_hash_hex)
-# only requires counter*counter*remaining hex chars of possibility space
+# only requires counter(nonce)*counter(nonce)*remaining hex chars of possibility space
 #basically reducing SHA256 to a combinatoric problem
