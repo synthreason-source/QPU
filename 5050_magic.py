@@ -6,12 +6,6 @@ Real optical bench + ITO spatial modulator + streamed temporal bins.
 Compares camera-derived optical arrival proxies after an unblock command
 for deterministic and random instruction schedules.
 
-Predictor
----------
-Uses an *arbitrary* 50/50 predictor: for each trial it flips a fair coin
-to guess "deterministic" or "random", completely ignoring the data.
-Confidence is fixed at 0.5 for all trials.
-
 Important measurement note
 --------------------------
 A normal USB/CMOS camera does not time-tag individual photons. This program
@@ -312,73 +306,6 @@ class RealOpticalArrivalComparison:
 
 
 # ==============================================================
-# ARBITRARY 50/50 PREDICTOR
-# ==============================================================
-
-@dataclass
-class TrialSummary:
-    schedule: str
-    trial: int
-    event_count: int
-    mean_delay_ns: float
-    std_delay_ns: float
-    mean_intensity: float
-    active_ito_cells: int
-    total_mode_intensity: float
-
-
-def summarize_trials(events: Sequence[ArrivalEvent], frame_records) -> list[TrialSummary]:
-    by_trial = {}
-    for e in events:
-        key = (e.schedule, e.trial)
-        if key not in by_trial:
-            by_trial[key] = []
-        by_trial[key].append(e)
-
-    frame_by_trial = {}
-    for rec in frame_records:
-        sched, trial, t, cmd_ns, frame_ns, total_int, active_cells = rec
-        key = (sched, trial)
-        if key not in frame_by_trial:
-            frame_by_trial[key] = []
-        frame_by_trial[key].append((t, total_int, active_cells))
-
-    summaries = []
-    for (schedule, trial), evs in by_trial.items():
-        delays = np.asarray([ev.delay_after_unblock_ns for ev in evs], dtype=np.float64)
-        intensities = np.asarray([ev.intensity for ev in evs], dtype=np.float64)
-        frames = frame_by_trial.get((schedule, trial), [])
-        total_int = sum(f[1] for f in frames)
-        active_cells = sum(f[2] for f in frames)
-        summaries.append(TrialSummary(
-            schedule=schedule,
-            trial=trial,
-            event_count=int(delays.size),
-            mean_delay_ns=float(delays.mean()) if delays.size else 0.0,
-            std_delay_ns=float(delays.std()) if delays.size else 0.0,
-            mean_intensity=float(intensities.mean()) if intensities.size else 0.0,
-            active_ito_cells=active_cells,
-            total_mode_intensity=total_int,
-        ))
-    return summaries
-
-
-def predict_arbitrary_50_50(summaries: list[TrialSummary], rng: np.random.Generator) -> list[tuple[TrialSummary, str, float]]:
-    """
-    Arbitrary 50/50 predictor:
-      - Ignores all features in `summaries`.
-      - For each trial, flips a fair coin to guess "deterministic" or "random".
-      - Confidence is fixed at 0.5 for every trial.
-    """
-    results = []
-    for s in summaries:
-        label = "deterministic" if rng.random() < 0.5 else "random"
-        conf = 0.5
-        results.append((s, label, conf))
-    return results
-
-
-# ==============================================================
 # REPORTING
 # ==============================================================
 
@@ -418,24 +345,8 @@ def write_frames(path: Path, records):
         w.writerows(records)
 
 
-def write_predictions(path: Path, predictions: list[tuple[TrialSummary, str, float]]):
-    with path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow([
-            "schedule", "trial", "event_count", "mean_delay_ns", "std_delay_ns",
-            "mean_intensity", "active_ito_cells", "total_mode_intensity",
-            "predicted_label", "confidence",
-        ])
-        for s, label, conf in predictions:
-            w.writerow([
-                s.schedule, s.trial, s.event_count, s.mean_delay_ns, s.std_delay_ns,
-                s.mean_intensity, s.active_ito_cells, s.total_mode_intensity,
-                label, conf,
-            ])
-
-
 def main():
-    p = argparse.ArgumentParser(description="Real optical-bench arrival-proxy comparison after ITO unblocking with arbitrary 50/50 predictor.")
+    p = argparse.ArgumentParser(description="Real optical-bench arrival-proxy comparison after ITO unblocking.")
     p.add_argument("--synthetic", action="store_true", help="Use synthetic frames instead of a physical camera.")
     p.add_argument("--synthetic-seed", type=int, default=2026)
     p.add_argument("--synthetic-noise", type=float, default=0.03)
@@ -510,23 +421,12 @@ def main():
         print(f"deterministic: events={sd['count']}, mean={sd['mean_ns']}, std={sd['std_ns']}, min={sd['min_ns']}, max={sd['max_ns']}")
         print(f"random       : events={sr['count']}, mean={sr['mean_ns']}, std={sr['std_ns']}, min={sr['min_ns']}, max={sr['max_ns']}")
 
-        # Summarize per-trial
-        all_frames = deterministic_frames + random_frames
-        all_events = deterministic_events + random_events
-        summaries = summarize_trials(all_events, all_frames)
-
-        # Arbitrary 50/50 predictions
-        pred_rng = np.random.default_rng(args.seed + 999)
-        predictions = predict_arbitrary_50_50(summaries, pred_rng)
-
         out = Path(args.output)
         out.mkdir(parents=True, exist_ok=True)
         write_events(out / "deterministic_arrival_events.csv", deterministic_events)
         write_events(out / "random_arrival_events.csv", random_events)
         write_frames(out / "deterministic_frame_records.csv", deterministic_frames)
         write_frames(out / "random_frame_records.csv", random_frames)
-        write_predictions(out / "trial_predictions_arbitrary_50_50.csv", predictions)
-
         metadata = {
             "camera_mode": camera_name,
             "serial_port": args.serial,
@@ -542,12 +442,9 @@ def main():
             "deterministic_stats": sd,
             "random_stats": sr,
             "measurement_note": "Camera frame timing and threshold crossings are arrival proxies, not single-photon time tags.",
-            "predictor_note": "Arbitrary 50/50 predictor ignores data; each trial is guessed deterministic/random with probability 0.5 and confidence 0.5.",
         }
         (out / "metadata.txt").write_text("\n".join(f"{k} = {v}" for k, v in metadata.items()), encoding="utf-8")
-
         print(f"\nSaved results to: {out}")
-        print("Arbitrary 50/50 predictions written to: trial_predictions_arbitrary_50_50.csv")
     finally:
         camera.close()
         ito.close()
