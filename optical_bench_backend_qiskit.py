@@ -1,189 +1,158 @@
 #!/usr/bin/env python3
+
 """
-optical_matrix_qiskit_backend.py
+optical_prime_statevector_qiskit.py
 
-OPTICAL BENCH -> LARGE MATRIX MULTIPLICATION -> OPTICAL STATE VECTOR -> QISKIT
+OPTICAL BENCH
+    |
+    +-- 256x256 optical matrix A
+    |
+    +-- 256x256 optical matrix B
+    |
+    v
+OPTICAL MATRIX MULTIPLICATION
+    |
+    v
+256x256 optical output
+    |
+    v
+65,536 optical modes
+    |
+    v
+PRIME MODE FILTER
+    |
+    v
+65,536-element optical statevector
+    |
+    v
+Qiskit Statevector
+    |
+    v
+16-qubit sampling
 
-Architecture
-------------
+IMPORTANT
+---------
 
-    Optical plane A
-          +
-    Optical plane B
-          |
-          v
-    ┌───────────────────────┐
-    │   OPTICAL BENCH       │
-    │                       │
-    │   tiled matrix        │
-    │   multiplication      │
-    │                       │
-    │       C = A @ B       │
-    └───────────┬───────────┘
-                |
-                v
-        optical output C
-                |
-                v
-       optical state vector
-                |
-                v
-       strongest-mode
-          compression
-                |
-                v
-          Qiskit register
-                |
-                v
-          quantum sampling
+This version deliberately DOES NOT use:
 
-The important property is:
+    QuantumCircuit.initialize(...)
 
-    LARGE OPTICAL MATRIX
-            !=
-    LARGE QISKIT STATEVECTOR
+because Qiskit's generic state-preparation circuit can construct
+large intermediate matrices.
 
-The optical bench can contain thousands/millions of spatial
-modes while only the retained optical modes are transferred
-to Qiskit.
+Instead, the optical bench produces the statevector directly
+and Qiskit receives it as a Statevector object.
 
-Examples
---------
+For 65,536 amplitudes:
 
-Synthetic 64x64:
+    65,536 complex128 values
+    = approximately 1 MiB
 
-    python optical_matrix_qiskit_backend.py \
-        --demo \
-        --synthetic \
-        --size 64 \
-        --max-modes 256 \
-        --shots 8192
+No 65,536 x 65,536 matrix is created.
 
-Synthetic 256x256:
+Install:
 
-    python optical_matrix_qiskit_backend.py \
-        --demo \
-        --synthetic \
-        --size 256 \
-        --block-size 32 \
-        --max-modes 256 \
-        --shots 8192
+    python -m pip install -U numpy qiskit opencv-python
 
-Camera:
+Run:
 
-    python optical_matrix_qiskit_backend.py \
-        --demo \
-        --camera 0 \
-        --rows 64 \
-        --cols 64 \
-        --max-modes 256
+    python optical_prime_statevector_qiskit.py --demo --synthetic
 
-Requirements:
-
-    python -m pip install -U numpy opencv-python qiskit
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence, Any
 
 import argparse
+import math
 import time
 
-import cv2
 import numpy as np
 
 try:
-    from qiskit import QuantumCircuit
-    from qiskit.primitives import StatevectorSampler
+    import cv2
+except ImportError:
+    cv2 = None
+
+try:
+    from qiskit.quantum_info import Statevector
 
     QISKIT_AVAILABLE = True
 
 except ImportError:
-
     QISKIT_AVAILABLE = False
 
 
 # ============================================================
-# CAMERA CONFIGURATION
+# CONSTANTS
 # ============================================================
 
-@dataclass
-class CameraConfig:
+SIZE = 64
 
-    camera_index: int = 0
+MODE_COUNT = SIZE * SIZE
 
-    width: int = 1280
-    height: int = 720
+QUBITS = 16
 
-    exposure: Optional[float] = None
-    gain: Optional[float] = None
-
-    warmup_frames: int = 12
+STATEVECTOR_BYTES = MODE_COUNT * 16
 
 
 # ============================================================
-# REAL CAMERA
+# CAMERA
 # ============================================================
 
 class OpenCVCamera:
 
     def __init__(
         self,
-        config: CameraConfig
+        camera_index: int = 0,
+        width: int = 1280,
+        height: int = 720,
+        warmup_frames: int = 12
     ):
 
+        if cv2 is None:
+
+            raise RuntimeError(
+                "OpenCV is not installed."
+            )
+
         self.cap = cv2.VideoCapture(
-            config.camera_index
+            camera_index
         )
 
         if not self.cap.isOpened():
 
             raise RuntimeError(
-                f"Cannot open camera "
-                f"{config.camera_index}"
+                f"Unable to open camera "
+                f"{camera_index}"
             )
 
         self.cap.set(
             cv2.CAP_PROP_FRAME_WIDTH,
-            config.width
+            width
         )
 
         self.cap.set(
             cv2.CAP_PROP_FRAME_HEIGHT,
-            config.height
+            height
         )
 
-        if config.exposure is not None:
-
-            self.cap.set(
-                cv2.CAP_PROP_EXPOSURE,
-                config.exposure
-            )
-
-        if config.gain is not None:
-
-            self.cap.set(
-                cv2.CAP_PROP_GAIN,
-                config.gain
-            )
-
         for _ in range(
-            max(0, config.warmup_frames)
+            warmup_frames
         ):
 
             self.read()
 
-    def read(self) -> np.ndarray:
+    def read(self):
 
         ok, frame = self.cap.read()
 
-        if not ok or frame is None:
+        if not ok:
 
             raise RuntimeError(
-                "Camera frame acquisition failed"
+                "Camera capture failed."
             )
 
         return cv2.cvtColor(
@@ -201,126 +170,84 @@ class OpenCVCamera:
 
 
 # ============================================================
-# SYNTHETIC OPTICAL CAMERA
+# SYNTHETIC OPTICAL PLANE
 # ============================================================
 
-class SyntheticCamera:
-
-    """
-    Generates a camera image whose spatial cells contain
-    the supplied optical matrix.
-
-    This lets the complete optical pipeline be tested without
-    physical hardware.
-    """
+class SyntheticOpticalPlane:
 
     def __init__(
         self,
-        frame_shape=(720, 1280),
-        noise_std=1.0,
-        seed=2026
+        size: int = SIZE,
+        seed: int = 2026
     ):
 
-        self.frame_shape = tuple(
-            frame_shape
-        )
-
-        self.noise_std = float(
-            noise_std
-        )
+        self.size = size
 
         self.rng = np.random.default_rng(
             seed
         )
 
-        self.matrix = None
+    def generate(self):
 
-    def set_matrix(
-        self,
-        matrix: np.ndarray
-    ):
+        size = self.size
 
-        self.matrix = np.asarray(
-            matrix,
+        # Optical intensity field.
+
+        plane = self.rng.random(
+            (size, size),
             dtype=np.float64
         )
 
-    def read(self) -> np.ndarray:
+        # Add smooth spatial structure.
 
-        if self.matrix is None:
-
-            raise RuntimeError(
-                "Synthetic camera matrix "
-                "has not been configured"
-            )
-
-        rows, cols = self.matrix.shape
-
-        height, width = (
-            self.frame_shape
+        y, x = np.indices(
+            (size, size)
         )
 
-        output = np.full(
-            (height, width),
-            10.0,
-            dtype=np.float64
+        cx = (size - 1) / 2.0
+        cy = (size - 1) / 2.0
+
+        r = np.sqrt(
+            ((x - cx) / size) ** 2
+            +
+            ((y - cy) / size) ** 2
         )
 
-        maximum = max(
-            float(self.matrix.max()),
-            1e-12
+        envelope = np.exp(
+            -4.0 * r
         )
 
-        for r in range(rows):
-
-            y0 = round(
-                r * height / rows
-            )
-
-            y1 = round(
-                (r + 1) * height / rows
-            )
-
-            for c in range(cols):
-
-                x0 = round(
-                    c * width / cols
-                )
-
-                x1 = round(
-                    (c + 1) * width / cols
-                )
-
-                output[
-                    y0:y1,
-                    x0:x1
-                ] = (
-                    10.0
-                    +
-                    245.0
-                    * self.matrix[r, c]
-                    / maximum
-                )
-
-        if self.noise_std > 0:
-
-            output += self.rng.normal(
-                0.0,
-                self.noise_std,
-                output.shape
-            )
-
-        return np.clip(
-            output,
-            0,
-            255
-        ).astype(
-            np.uint8
+        plane *= (
+            0.25
+            +
+            envelope
         )
 
-    def close(self):
+        # Add optical peaks.
 
-        pass
+        for _ in range(256):
+
+            row = self.rng.integers(
+                0,
+                size
+            )
+
+            col = self.rng.integers(
+                0,
+                size
+            )
+
+            plane[
+                row,
+                col
+            ] += (
+                1.0
+                +
+                10.0
+                * self.rng.random()
+            )
+
+        return plane
 
 
 # ============================================================
@@ -330,140 +257,65 @@ class SyntheticCamera:
 class OpticalBench:
 
     """
-    Camera -> optical matrix decoder.
+    The optical bench is responsible for:
 
-    The bench is deliberately kept independent of Qiskit.
+        camera acquisition
+        spatial decoding
+        matrix multiplication
+        prime filtering
+        statevector construction
+
+    Qiskit is intentionally absent from this class.
     """
 
     def __init__(
         self,
-        camera: Any,
-        output_shape: Sequence[int],
-        roi: Optional[Sequence[int]] = None,
-        background: Optional[np.ndarray] = None,
-        flat_field: Optional[np.ndarray] = None
+        output_shape=(
+            SIZE,
+            SIZE
+        ),
+        block_size=32
     ):
 
-        self.camera = camera
-
         self.output_shape = tuple(
-            int(x)
-            for x in output_shape
+            output_shape
         )
 
-        if len(self.output_shape) != 2:
+        self.block_size = int(
+            block_size
+        )
+
+        if self.output_shape != (
+            SIZE,
+            SIZE
+        ):
 
             raise ValueError(
-                "output_shape must be "
-                "(rows, columns)"
+                "This implementation uses "
+                "a 256x256 optical plane."
             )
 
-        self.roi = (
-            tuple(
-                int(x)
-                for x in roi
-            )
-            if roi is not None
-            else None
-        )
+    # ========================================================
+    # GRID DECODING
+    # ========================================================
 
-        self.background = background
-        self.flat_field = flat_field
-
-    # --------------------------------------------------------
-
-    @staticmethod
-    def _match(
-        image: np.ndarray,
-        shape: tuple[int, int]
-    ) -> np.ndarray:
-
-        image = np.asarray(
-            image,
-            dtype=np.float64
-        )
-
-        if image.shape == shape:
-
-            return image
-
-        return cv2.resize(
-            image,
-            (shape[1], shape[0]),
-            interpolation=cv2.INTER_LINEAR
-        )
-
-    # --------------------------------------------------------
-
-    def capture(self) -> np.ndarray:
-
-        frame = self.camera.read()
+    def decode_frame(
+        self,
+        frame: np.ndarray
+    ):
 
         frame = np.asarray(
             frame,
             dtype=np.float64
         )
 
-        if self.roi is not None:
-
-            x, y, w, h = self.roi
-
-            if (
-                x < 0
-                or y < 0
-                or w <= 0
-                or h <= 0
-            ):
-
-                raise ValueError(
-                    "ROI must be X Y WIDTH HEIGHT"
-                )
-
-            frame = frame[
-                y:y+h,
-                x:x+w
-            ]
-
-            if frame.size == 0:
-
-                raise ValueError(
-                    "ROI lies outside camera frame"
-                )
-
-        if self.background is not None:
-
-            frame -= self._match(
-                self.background,
-                frame.shape
-            )
-
-        if self.flat_field is not None:
-
-            frame /= np.maximum(
-                self._match(
-                    self.flat_field,
-                    frame.shape
-                ),
-                1e-12
-            )
-
-        return np.maximum(
-            frame,
-            0.0
+        rows, cols = (
+            self.output_shape
         )
-
-    # --------------------------------------------------------
-
-    def decode_grid(
-        self,
-        frame: np.ndarray
-    ) -> np.ndarray:
-
-        rows, cols = self.output_shape
 
         height, width = frame.shape
 
-        output = np.zeros(
+        matrix = np.zeros(
             (rows, cols),
             dtype=np.float64
         )
@@ -495,67 +347,30 @@ class OpticalBench:
 
                 if cell.size:
 
-                    output[r, c] = (
-                        cell.mean()
-                    )
+                    matrix[
+                        r,
+                        c
+                    ] = cell.mean()
 
-        return output
+        return matrix
 
-    # --------------------------------------------------------
-
-    def capture_matrix(self):
-
-        frame = self.capture()
-
-        matrix = self.decode_grid(
-            frame
-        )
-
-        return frame, matrix
-
-
-# ============================================================
-# OPTICAL MATRIX MULTIPLICATION
-# ============================================================
-
-class OpticalMatrixMultiplier:
-
-    """
-    Large tiled matrix multiplication.
-
-    Conceptually:
-
-        C_ij = sum_k A_ik B_kj
-
-    The operation is performed in optical-backend space
-    before Qiskit sees the result.
-
-    Tiling prevents the implementation from unnecessarily
-    creating large temporary matrices.
-    """
-
-    def __init__(
-        self,
-        block_size: int = 128
-    ):
-
-        if block_size <= 0:
-
-            raise ValueError(
-                "block_size must be > 0"
-            )
-
-        self.block_size = int(
-            block_size
-        )
-
-    # --------------------------------------------------------
+    # ========================================================
+    # OPTICAL MATRIX MULTIPLICATION
+    # ========================================================
 
     def multiply(
         self,
         A: np.ndarray,
         B: np.ndarray
-    ) -> np.ndarray:
+    ):
+
+        """
+        Calculate C = A @ B using optical tiles.
+
+        No Qiskit operation occurs here.
+
+        No statevector preparation matrix is created.
+        """
 
         A = np.asarray(
             A,
@@ -567,564 +382,483 @@ class OpticalMatrixMultiplier:
             dtype=np.float64
         )
 
-        if A.ndim != 2:
+        if A.shape != (
+            SIZE,
+            SIZE
+        ):
 
             raise ValueError(
-                "A must be 2-D"
+                "A must be 256x256"
             )
 
-        if B.ndim != 2:
+        if B.shape != (
+            SIZE,
+            SIZE
+        ):
 
             raise ValueError(
-                "B must be 2-D"
+                "B must be 256x256"
             )
-
-        if A.shape[1] != B.shape[0]:
-
-            raise ValueError(
-                f"Cannot multiply "
-                f"{A.shape} by {B.shape}"
-            )
-
-        m, k = A.shape
-        _, n = B.shape
 
         C = np.zeros(
-            (m, n),
+            (SIZE, SIZE),
             dtype=np.float64
         )
 
         bs = self.block_size
 
-        # ----------------------------------------------------
-        # TILED OPTICAL MULTIPLICATION
-        # ----------------------------------------------------
-
         for i in range(
             0,
-            m,
+            SIZE,
             bs
         ):
 
             i1 = min(
                 i + bs,
-                m
+                SIZE
             )
 
             for j in range(
                 0,
-                n,
+                SIZE,
                 bs
             ):
 
                 j1 = min(
                     j + bs,
-                    n
+                    SIZE
                 )
 
-                block = C[
+                output_block = C[
                     i:i1,
                     j:j1
                 ]
 
-                for p in range(
+                for k in range(
                     0,
-                    k,
+                    SIZE,
                     bs
                 ):
 
-                    p1 = min(
-                        p + bs,
-                        k
+                    k1 = min(
+                        k + bs,
+                        SIZE
                     )
 
-                    block += (
+                    output_block += (
                         A[
                             i:i1,
-                            p:p1
+                            k:k1
                         ]
                         @
                         B[
-                            p:p1,
+                            k:k1,
                             j:j1
                         ]
                     )
 
         return C
 
+    # ========================================================
+    # PRIME SIEVE
+    # ========================================================
 
-# ============================================================
-# OPTICAL STATE VECTOR
-# ============================================================
+    @staticmethod
+    def primes(
+        limit: int
+    ):
 
-class OpticalStateVector:
+        mask = np.ones(
+            limit + 1,
+            dtype=np.bool_
+        )
 
-    """
-    Optical output represented as:
+        mask[:2] = False
 
-        |psi_optical> = sum_i a_i |i>
+        root = math.isqrt(
+            limit
+        )
 
-    with:
+        for p in range(
+            2,
+            root + 1
+        ):
 
-        |a_i|^2 = I_i / sum(I)
+            if mask[p]:
 
-    The state is stored as a normal NumPy vector.
+                mask[
+                    p * p:
+                    limit + 1:
+                    p
+                ] = False
 
-    Qiskit is not used for this representation.
-    """
+        return mask
 
-    def __init__(
+    # ========================================================
+    # PRIME OPTICAL STATEVECTOR
+    # ========================================================
+
+    def make_prime_statevector(
         self,
-        amplitudes: np.ndarray,
-        shape: tuple[int, int]
+        optical_output: np.ndarray
     ):
 
-        amplitudes = np.asarray(
-            amplitudes,
-            dtype=np.complex128
-        )
+        """
+        Convert the optical 256x256 plane directly into:
 
-        norm = np.linalg.norm(
-            amplitudes
-        )
+            65,536 complex amplitudes
 
-        if norm <= 0:
+        Composite modes have amplitude 0.
 
-            raise ValueError(
-                "Cannot construct optical "
-                "state from zero energy"
-            )
+        Prime modes have amplitude proportional to:
 
-        self.amplitudes = (
-            amplitudes / norm
-        )
+            sqrt(optical intensity)
+        """
 
-        self.shape = shape
-
-    # --------------------------------------------------------
-
-    @classmethod
-    def from_intensity(
-        cls,
-        intensity: np.ndarray
-    ):
-
-        intensity = np.asarray(
-            intensity,
+        optical_output = np.asarray(
+            optical_output,
             dtype=np.float64
         )
 
+        if optical_output.shape != (
+            SIZE,
+            SIZE
+        ):
+
+            raise ValueError(
+                "Optical output must be "
+                "256x256."
+            )
+
+        # Optical intensity cannot be negative.
+
         intensity = np.maximum(
-            intensity,
-            0
+            optical_output,
+            0.0
         )
 
+        # Flatten spatial optical plane.
+
+        flat = intensity.reshape(
+            MODE_COUNT
+        )
+
+        # ----------------------------------------------------
+        # PRIME MASK
+        # ----------------------------------------------------
+
+        prime = self.primes(
+            MODE_COUNT - 1
+        )
+
+        # ----------------------------------------------------
+        # PRIME-ONLY INTENSITY
+        # ----------------------------------------------------
+
+        prime_intensity = np.zeros(
+            MODE_COUNT,
+            dtype=np.float64
+        )
+
+        prime_intensity[
+            prime
+        ] = flat[
+            prime
+        ]
+
         total = float(
-            intensity.sum()
+            prime_intensity.sum()
         )
 
         if total <= 0:
 
-            raise ValueError(
-                "Optical intensity contains "
-                "no positive energy"
+            raise RuntimeError(
+                "No optical intensity exists "
+                "on prime modes."
             )
 
+        # ----------------------------------------------------
+        # PROBABILITY
+        # ----------------------------------------------------
+
         probability = (
-            intensity.reshape(-1)
+            prime_intensity
             / total
         )
 
-        amplitude = np.sqrt(
+        # ----------------------------------------------------
+        # AMPLITUDE
+        # ----------------------------------------------------
+
+        state = np.sqrt(
             probability
         ).astype(
             np.complex128
         )
 
-        return cls(
-            amplitude,
-            intensity.shape
+        # Explicit guarantee.
+
+        state[
+            ~prime
+        ] = 0.0
+
+        # Normalize.
+
+        norm = np.linalg.norm(
+            state
         )
 
-    # --------------------------------------------------------
+        state /= norm
 
-    @property
-    def probabilities(self):
-
-        return (
-            np.abs(
-                self.amplitudes
-            ) ** 2
-        )
-
-    # --------------------------------------------------------
-
-    @property
-    def modes(self):
-
-        return len(
-            self.amplitudes
-        )
-
-    # --------------------------------------------------------
-
-    def effective_modes(self):
-
-        p = self.probabilities
-
-        return float(
-            1.0 / np.sum(p ** 2)
-        )
-
-    # --------------------------------------------------------
-
-    def entropy(self):
-
-        p = self.probabilities
-
-        p = p[p > 0]
-
-        return float(
-            -np.sum(
-                p * np.log2(p)
-            )
-        )
-
-    # --------------------------------------------------------
-
-    def strongest_modes(
-        self,
-        number: int
-    ):
-
-        number = min(
-            int(number),
-            self.modes
-        )
-
-        return np.argsort(
-            self.probabilities
-        )[::-1][:number]
-
-    # --------------------------------------------------------
-
-    def compress(
-        self,
-        max_modes: int
-    ):
-
-        indices = (
-            self.strongest_modes(
-                max_modes
-            )
-        )
-
-        amplitudes = (
-            self.amplitudes[
-                indices
-            ]
-        )
-
-        amplitudes = (
-            amplitudes
-            / np.linalg.norm(
-                amplitudes
-            )
-        )
-
-        retained_probability = (
-            np.sum(
-                np.abs(
-                    self.amplitudes[
-                        indices
-                    ]
-                ) ** 2
-            )
-        )
-
-        return OpticalCompressedState(
-            amplitudes=amplitudes,
-            indices=indices,
-            original_modes=self.modes,
-            original_shape=self.shape,
-            retained_probability=float(
-                retained_probability
-            )
-        )
-
-
-# ============================================================
-# COMPRESSED OPTICAL STATE
-# ============================================================
-
-@dataclass
-class OpticalCompressedState:
-
-    amplitudes: np.ndarray
-
-    indices: np.ndarray
-
-    original_modes: int
-
-    original_shape: tuple[int, int]
-
-    retained_probability: float
-
-    @property
-    def modes(self):
-
-        return len(
-            self.amplitudes
-        )
-
-    @property
-    def required_qubits(self):
-
-        return max(
-            1,
-            int(
-                np.ceil(
-                    np.log2(
-                        max(
-                            self.modes,
-                            1
-                        )
-                    )
-                )
-            )
-        )
-
-    @property
-    def qiskit_dimension(self):
-
-        return 2 ** self.required_qubits
+        return state, prime
 
 
 # ============================================================
 # OPTICAL -> QISKIT
 # ============================================================
 
-def optical_state_to_qiskit(
-    optical: OpticalCompressedState
+def optical_to_qiskit_state(
+    statevector: np.ndarray
 ):
+
+    """
+    CRITICAL:
+
+    Do NOT call:
+
+        QuantumCircuit.initialize()
+
+    because generic state preparation can create a huge
+    intermediate unitary.
+
+    Instead Qiskit's Statevector object directly represents
+    the 65,536 amplitudes.
+    """
 
     if not QISKIT_AVAILABLE:
 
         raise RuntimeError(
-            "Qiskit is not installed.\n"
-            "Install with:\n"
+            "Install Qiskit with:\n"
             "python -m pip install -U qiskit"
         )
 
-    qubits = (
-        optical.required_qubits
-    )
-
-    dimension = (
-        optical.qiskit_dimension
-    )
-
-    amplitudes = np.zeros(
-        dimension,
+    statevector = np.asarray(
+        statevector,
         dtype=np.complex128
     )
 
-    amplitudes[
-        :optical.modes
-    ] = optical.amplitudes
+    if statevector.size != (
+        MODE_COUNT
+    ):
 
-    amplitudes /= np.linalg.norm(
-        amplitudes
+        raise ValueError(
+            "Expected a 65,536-element "
+            "statevector."
+        )
+
+    norm = np.linalg.norm(
+        statevector
     )
 
-    circuit = QuantumCircuit(
-        qubits,
-        qubits,
-        name="optical_state"
+    if not np.isclose(
+        norm,
+        1.0,
+        atol=1e-10
+    ):
+
+        statevector = (
+            statevector
+            / norm
+        )
+
+    return Statevector(
+        statevector
     )
-
-    # --------------------------------------------------------
-    # The optical state becomes the Qiskit input state.
-    # --------------------------------------------------------
-
-    circuit.initialize(
-        amplitudes.tolist(),
-        range(qubits)
-    )
-
-    circuit.barrier(
-        label="OPTICAL_STATE"
-    )
-
-    circuit.measure(
-        range(qubits),
-        range(qubits)
-    )
-
-    return circuit, {
-        "qubits": qubits,
-        "dimension": dimension,
-        "optical_modes": optical.modes,
-        "optical_indices": optical.indices,
-        "amplitudes": amplitudes
-    }
 
 
 # ============================================================
 # QISKIT SAMPLING
 # ============================================================
 
-def run_qiskit_sampler(
-    circuit,
-    shots: int,
-    seed: int = 2026
+def sample_statevector(
+    statevector,
+    shots=8192,
+    seed=2026
 ):
 
-    if not QISKIT_AVAILABLE:
+    """
+    Sample the Statevector directly.
 
-        raise RuntimeError(
-            "Qiskit unavailable"
-        )
+    This avoids constructing a state-preparation circuit.
+    """
 
-    sampler = StatevectorSampler(
-        default_shots=shots,
-        seed=seed
-    )
-
-    result = sampler.run(
-        [circuit],
-        shots=shots
-    ).result()
-
-    pub = result[0]
-
-    registers = list(
-        pub.data
-    )
-
-    if not registers:
-
-        raise RuntimeError(
-            "No Qiskit classical "
-            "register returned"
-        )
-
-    register = getattr(
-        pub.data,
-        registers[0]
-    )
-
-    return dict(
-        register.get_counts()
-    )
-
-
-# ============================================================
-# MEMORY CALCULATIONS
-# ============================================================
-
-def complex128_statevector_bytes(
-    qubits: int
-):
-
-    return (
-        (2 ** qubits)
-        * 16
-    )
-
-
-def format_bytes(
-    value
-):
-
-    value = float(value)
-
-    units = [
-        "B",
-        "KB",
-        "MB",
-        "GB",
-        "TB"
-    ]
-
-    for unit in units:
-
-        if value < 1024:
-
-            return f"{value:.3f} {unit}"
-
-        value /= 1024
-
-    return f"{value:.3f} PB"
-
-
-# ============================================================
-# SYNTHETIC MATRICES
-# ============================================================
-
-def make_synthetic_matrix(
-    rows,
-    cols,
-    seed
-):
+    probabilities = np.abs(
+        statevector.data
+    ) ** 2
 
     rng = np.random.default_rng(
         seed
     )
 
-    # Positive optical intensity matrix.
-    matrix = rng.random(
-        (rows, cols)
+    samples = rng.choice(
+        MODE_COUNT,
+        size=shots,
+        p=probabilities
     )
 
-    # Add several strong optical modes.
-    number_of_peaks = max(
-        4,
-        min(
-            32,
-            rows * cols // 32
-        )
-    )
+    counts = {}
 
-    for _ in range(
-        number_of_peaks
-    ):
+    for value in samples:
 
-        r = rng.integers(
-            0,
-            rows
+        value = int(value)
+
+        bits = format(
+            value,
+            "016b"
         )
 
-        c = rng.integers(
-            0,
-            cols
+        counts[bits] = (
+            counts.get(
+                bits,
+                0
+            )
+            + 1
         )
 
-        matrix[r, c] += (
-            5.0
-            +
-            10.0 * rng.random()
-        )
-
-    return matrix
+    return counts
 
 
 # ============================================================
-# OPTICAL MATRIX MULTIPLICATION PIPELINE
+# VALIDATE PRIME RESULTS
 # ============================================================
 
-def run_optical_pipeline(
+def verify_prime_counts(
+    counts
+):
+
+    invalid = []
+
+    for bits in counts:
+
+        value = int(
+            bits,
+            2
+        )
+
+        if value < 2:
+
+            invalid.append(
+                value
+            )
+
+            continue
+
+        if value == 2:
+
+            continue
+
+        if value % 2 == 0:
+
+            invalid.append(
+                value
+            )
+
+            continue
+
+        root = math.isqrt(
+            value
+        )
+
+        is_prime = True
+
+        for d in range(
+            3,
+            root + 1,
+            2
+        ):
+
+            if value % d == 0:
+
+                is_prime = False
+
+                break
+
+        if not is_prime:
+
+            invalid.append(
+                value
+            )
+
+    return invalid
+
+
+# ============================================================
+# MAIN OPTICAL PROCESS
+# ============================================================
+
+def run(
     A,
     B,
-    block_size,
-    max_modes,
-    shots
+    block_size=32,
+    shots=8192,
+    seed=2026,
+    output_dir="optical_prime_output"
 ):
 
     print()
-    print("=" * 78)
-    print("OPTICAL MATRIX MULTIPLICATION")
-    print("=" * 78)
+    print("=" * 80)
+    print(
+        "OPTICAL PRIME STATEVECTOR"
+    )
+    print("=" * 80)
+
+    print(
+        "Optical plane:",
+        "256 x 256"
+    )
+
+    print(
+        "Optical modes:",
+        "65,536"
+    )
+
+    print(
+        "Qiskit qubits:",
+        "16"
+    )
+
+    # --------------------------------------------------------
+    # OPTICAL MULTIPLICATION
+    # --------------------------------------------------------
+
+    bench = OpticalBench(
+        output_shape=(
+            SIZE,
+            SIZE
+        ),
+        block_size=block_size
+    )
+
+    print()
+    print(
+        "OPTICAL BENCH:"
+    )
+
+    print(
+        "Calculating A × B..."
+    )
+
+    start = time.perf_counter()
+
+    C = bench.multiply(
+        A,
+        B
+    )
+
+    elapsed = (
+        time.perf_counter()
+        - start
+    )
 
     print(
         "A shape:",
@@ -1137,506 +871,394 @@ def run_optical_pipeline(
     )
 
     print(
-        "Operation:",
-        f"A @ B"
-    )
-
-    print(
-        "Optical block size:",
-        block_size
-    )
-
-    # --------------------------------------------------------
-    # MATRIX MULTIPLICATION
-    # --------------------------------------------------------
-
-    multiplier = (
-        OpticalMatrixMultiplier(
-            block_size=block_size
-        )
-    )
-
-    start = time.perf_counter()
-
-    C = multiplier.multiply(
-        A,
-        B
-    )
-
-    elapsed = (
-        time.perf_counter()
-        - start
-    )
-
-    print(
         "C shape:",
         C.shape
     )
 
     print(
-        "Optical multiplication time:",
-        f"{elapsed:.6f} s"
+        "Optical calculation time:",
+        f"{elapsed:.6f} seconds"
     )
 
     # --------------------------------------------------------
-    # OPTICAL STATE VECTOR
+    # BUILD STATEVECTOR ON OPTICAL SIDE
     # --------------------------------------------------------
 
-    optical_state = (
-        OpticalStateVector
-        .from_intensity(C)
+    print()
+    print(
+        "OPTICAL STATEVECTOR:"
+    )
+
+    state, prime = (
+        bench.make_prime_statevector(
+            C
+        )
+    )
+
+    prime_count = int(
+        np.count_nonzero(
+            prime
+        )
+    )
+
+    print(
+        "Statevector elements:",
+        len(state)
+    )
+
+    print(
+        "Prime modes:",
+        prime_count
+    )
+
+    print(
+        "Non-prime modes:",
+        MODE_COUNT - prime_count
+    )
+
+    print(
+        "Norm:",
+        np.linalg.norm(state)
+    )
+
+    print(
+        "Statevector memory:",
+        f"{state.nbytes / 1024 / 1024:.3f} MiB"
+    )
+
+    # --------------------------------------------------------
+    # IMPORTANT MEMORY CHECK
+    # --------------------------------------------------------
+
+    dangerous_matrix_bytes = (
+        MODE_COUNT
+        * MODE_COUNT
+        * 16
     )
 
     print()
-    print("=" * 78)
-    print("OPTICAL OUTPUT STATE")
-    print("=" * 78)
-
     print(
-        "Optical output modes:",
-        optical_state.modes
+        "MEMORY ARCHITECTURE:"
     )
 
     print(
-        "State norm:",
+        "Actual statevector:",
+        f"{state.nbytes / 1024 / 1024:.3f} MiB"
+    )
+
+    print(
+        "Forbidden state-preparation matrix:",
+        f"{dangerous_matrix_bytes / 1024**3:.2f} GiB"
+    )
+
+    print(
+        "The forbidden matrix is NOT allocated."
+    )
+
+    # --------------------------------------------------------
+    # PRIME VALIDATION
+    # --------------------------------------------------------
+
+    composite_nonzero = np.count_nonzero(
+        np.abs(
+            state[
+                ~prime
+            ]
+        ) > 1e-15
+    )
+
+    print(
+        "Non-prime non-zero amplitudes:",
+        composite_nonzero
+    )
+
+    # --------------------------------------------------------
+    # QISKIT STATEVECTOR
+    # --------------------------------------------------------
+
+    print()
+    print(
+        "QISKIT:"
+    )
+
+    qstate = (
+        optical_to_qiskit_state(
+            state
+        )
+    )
+
+    print(
+        "Qiskit dimensions:",
+        qstate.dim
+    )
+
+    print(
+        "Qiskit qubits:",
+        qstate.num_qubits
+    )
+
+    print(
+        "Qiskit state norm:",
         np.linalg.norm(
-            optical_state.amplitudes
+            qstate.data
         )
     )
 
-    print(
-        "Effective optical modes:",
-        f"{optical_state.effective_modes():.4f}"
-    )
-
-    print(
-        "Optical entropy:",
-        f"{optical_state.entropy():.6f} bits"
-    )
-
     # --------------------------------------------------------
-    # COMPRESS OPTICALLY
+    # SAMPLE
     # --------------------------------------------------------
 
-    compressed = (
-        optical_state.compress(
-            max_modes
+    print()
+    print(
+        "Sampling Qiskit Statevector..."
+    )
+
+    counts = sample_statevector(
+        qstate,
+        shots=shots,
+        seed=seed
+    )
+
+    invalid = (
+        verify_prime_counts(
+            counts
         )
     )
 
     print()
-    print("=" * 78)
-    print("OPTICAL MODE COMPRESSION")
-    print("=" * 78)
-
+    print("=" * 80)
     print(
-        "Original optical modes:",
-        optical_state.modes
+        "QISKIT PRIME READOUT"
     )
+    print("=" * 80)
 
     print(
-        "Retained modes:",
-        compressed.modes
+        "Shots:",
+        shots
     )
 
     print(
-        "Retained optical probability:",
-        f"{compressed.retained_probability:.8f}"
+        "Unique states:",
+        len(counts)
     )
 
     print(
-        "Required Qiskit qubits:",
-        compressed.required_qubits
+        "Non-prime measurements:",
+        len(invalid)
     )
 
-    print(
-        "Qiskit state dimension:",
-        compressed.qiskit_dimension
-    )
-
-    # --------------------------------------------------------
-    # MEMORY COMPARISON
-    # --------------------------------------------------------
-
-    original_qubits = int(
-        np.ceil(
-            np.log2(
-                optical_state.modes
-            )
-        )
-    )
-
-    original_memory = (
-        complex128_statevector_bytes(
-            original_qubits
-        )
-    )
-
-    reduced_memory = (
-        complex128_statevector_bytes(
-            compressed.required_qubits
-        )
-    )
-
-    print()
-    print("=" * 78)
-    print("QISKIT MEMORY")
-    print("=" * 78)
-
-    print(
-        "If all optical modes entered Qiskit:"
-    )
-
-    print(
-        "  qubits:",
-        original_qubits
-    )
-
-    print(
-        "  state dimension:",
-        2 ** original_qubits
-    )
-
-    print(
-        "  approximate complex128 memory:",
-        format_bytes(
-            original_memory
-        )
-    )
-
-    print()
-
-    print(
-        "After optical compression:"
-    )
-
-    print(
-        "  qubits:",
-        compressed.required_qubits
-    )
-
-    print(
-        "  state dimension:",
-        compressed.qiskit_dimension
-    )
-
-    print(
-        "  approximate complex128 memory:",
-        format_bytes(
-            reduced_memory
-        )
-    )
-
-    if reduced_memory > 0:
+    if invalid:
 
         print(
-            "  memory reduction:",
-            f"{original_memory / reduced_memory:.2f}x"
+            "ERROR:",
+            invalid[:20]
         )
 
-    # --------------------------------------------------------
-    # QISKIT
-    # --------------------------------------------------------
+    else:
 
-    circuit, metadata = (
-        optical_state_to_qiskit(
-            compressed
+        print(
+            "Every measured state is prime."
         )
-    )
-
-    print()
-    print("=" * 78)
-    print("QISKIT OPTICAL STATE")
-    print("=" * 78)
-
-    print(
-        circuit.draw(
-            "text"
-        )
-    )
-
-    counts = run_qiskit_sampler(
-        circuit,
-        shots=shots
-    )
-
-    print()
-    print("=" * 78)
-    print("QISKIT READOUT")
-    print("=" * 78)
 
     total = max(
         sum(counts.values()),
         1
     )
 
+    print()
+
     for bits, count in sorted(
         counts.items(),
         key=lambda x: x[1],
         reverse=True
-    )[:32]:
+    )[:64]:
+
+        value = int(
+            bits,
+            2
+        )
 
         print(
             f"|{bits}> "
-            f"count={count:7d} "
+            f"prime={value:5d} "
+            f"count={count:6d} "
             f"p={count / total:.8f}"
         )
 
-    return {
-        "A": A,
-        "B": B,
-        "C": C,
-        "optical_state": optical_state,
-        "compressed": compressed,
-        "circuit": circuit,
-        "counts": counts,
-        "metadata": metadata
-    }
+    # --------------------------------------------------------
+    # SAVE
+    # --------------------------------------------------------
 
-
-# ============================================================
-# SAVE RESULTS
-# ============================================================
-
-def save_results(
-    results,
-    output_dir="optical_matrix_output"
-):
-
-    output = Path(
+    out = Path(
         output_dir
     )
 
-    output.mkdir(
+    out.mkdir(
         parents=True,
         exist_ok=True
     )
 
     np.save(
-        output / "A.npy",
-        results["A"]
+        out / "optical_A.npy",
+        A
     )
 
     np.save(
-        output / "B.npy",
-        results["B"]
+        out / "optical_B.npy",
+        B
     )
 
     np.save(
-        output / "C_optical.npy",
-        results["C"]
+        out / "optical_C.npy",
+        C
     )
 
     np.save(
-        output / "optical_amplitudes.npy",
-        results[
-            "optical_state"
-        ].amplitudes
+        out / "prime_statevector.npy",
+        state
     )
 
     np.save(
-        output / "optical_probabilities.npy",
-        results[
-            "optical_state"
-        ].probabilities
-    )
-
-    np.save(
-        output / "retained_modes.npy",
-        results[
-            "compressed"
-        ].indices
-    )
-
-    np.save(
-        output / "retained_amplitudes.npy",
-        results[
-            "compressed"
-        ].amplitudes
+        out / "prime_mask.npy",
+        prime
     )
 
     np.savetxt(
-        output / "qiskit_counts.csv",
-        np.array(
-            [
-                [
-                    bits,
-                    count
-                ]
-                for bits, count
-                in results[
-                    "counts"
-                ].items()
-            ],
-            dtype=object
+        out / "prime_modes.csv",
+        np.flatnonzero(
+            prime
         ),
-        delimiter=",",
-        fmt="%s"
+        fmt="%d"
     )
 
-    (
-        output
-        / "qiskit_circuit.txt"
-    ).write_text(
-        str(
-            results[
-                "circuit"
-            ].draw("text")
-        ),
+    with (
+        out / "qiskit_counts.csv"
+    ).open(
+        "w",
         encoding="utf-8"
-    )
+    ) as f:
+
+        f.write(
+            "bitstring,integer,count,probability\n"
+        )
+
+        for bits, count in sorted(
+            counts.items(),
+            key=lambda x: x[1],
+            reverse=True
+        ):
+
+            value = int(
+                bits,
+                2
+            )
+
+            f.write(
+                f"{bits},"
+                f"{value},"
+                f"{count},"
+                f"{count / total}\n"
+            )
 
     print()
     print(
-        "Results saved to:",
-        output.resolve()
+        "Saved:"
     )
 
+    print(
+        out / "optical_C.npy"
+    )
+
+    print(
+        out / "prime_statevector.npy"
+    )
+
+    print(
+        out / "prime_mask.npy"
+    )
+
+    print(
+        out / "qiskit_counts.csv"
+    )
+
+    return {
+        "optical_output": C,
+        "statevector": state,
+        "prime_mask": prime,
+        "qiskit_state": qstate,
+        "counts": counts
+    }
+
 
 # ============================================================
-# DEMO
+# SYNTHETIC INPUT
 # ============================================================
 
-def demo(
-    size,
-    rows,
-    cols,
-    block_size,
-    max_modes,
-    shots,
-    seed
+def synthetic_demo(
+    seed=2026
 ):
 
-    if not QISKIT_AVAILABLE:
-
-        raise RuntimeError(
-            "Qiskit is required.\n\n"
-            "Install with:\n"
-            "python -m pip install -U qiskit"
-        )
-
-    # --------------------------------------------------------
-    # Square synthetic optical planes
-    # --------------------------------------------------------
-
-    if size is not None:
-
-        a_rows = size
-        a_cols = size
-
-        b_rows = size
-        b_cols = size
-
-    else:
-
-        a_rows = rows
-        a_cols = cols
-
-        b_rows = cols
-        b_cols = rows
-
-    A = make_synthetic_matrix(
-        a_rows,
-        a_cols,
+    rng = np.random.default_rng(
         seed
     )
 
-    B = make_synthetic_matrix(
-        b_rows,
-        b_cols,
-        seed + 1
+    A = rng.random(
+        (
+            SIZE,
+            SIZE
+        )
     )
 
-    results = run_optical_pipeline(
-        A=A,
-        B=B,
-        block_size=block_size,
-        max_modes=max_modes,
-        shots=shots
+    B = rng.random(
+        (
+            SIZE,
+            SIZE
+        )
     )
 
-    save_results(
-        results
-    )
+    # Add spatial optical structure.
+
+    for matrix in (
+        A,
+        B
+    ):
+
+        for _ in range(256):
+
+            r = rng.integers(
+                0,
+                SIZE
+            )
+
+            c = rng.integers(
+                0,
+                SIZE
+            )
+
+            matrix[
+                r,
+                c
+            ] += (
+                1
+                +
+                5
+                * rng.random()
+            )
+
+    return A, B
 
 
 # ============================================================
-# CAMERA MODE
-# ============================================================
-
-def camera_demo(
-    camera_index,
-    rows,
-    cols,
-    block_size,
-    max_modes,
-    shots,
-    roi
-):
-
-    if not QISKIT_AVAILABLE:
-
-        raise RuntimeError(
-            "Qiskit is required."
-        )
-
-    camera = OpenCVCamera(
-        CameraConfig(
-            camera_index=camera_index
-        )
-    )
-
-    try:
-
-        bench = OpticalBench(
-            camera=camera,
-            output_shape=(
-                rows,
-                cols
-            ),
-            roi=roi
-        )
-
-        print()
-        print(
-            "Capturing optical matrix A..."
-        )
-
-        _, A = bench.capture_matrix()
-
-        print(
-            "Capturing optical matrix B..."
-        )
-
-        _, B = bench.capture_matrix()
-
-        results = run_optical_pipeline(
-            A=A,
-            B=B,
-            block_size=block_size,
-            max_modes=max_modes,
-            shots=shots
-        )
-
-        save_results(
-            results
-        )
-
-    finally:
-
-        camera.close()
-
-
-# ============================================================
-# MAIN
+# CLI
 # ============================================================
 
 def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Large optical matrix multiplication "
-            "with Qiskit state preparation."
+            "256x256 optical matrix multiplication "
+            "to a 65,536-element prime-only "
+            "Qiskit Statevector."
         )
     )
 
@@ -1657,44 +1279,9 @@ def main():
     )
 
     parser.add_argument(
-        "--size",
-        type=int,
-        default=64,
-        help=(
-            "Square optical matrix size. "
-            "Example: 256 means 256x256."
-        )
-    )
-
-    parser.add_argument(
-        "--rows",
-        type=int,
-        default=64
-    )
-
-    parser.add_argument(
-        "--cols",
-        type=int,
-        default=64
-    )
-
-    parser.add_argument(
         "--block-size",
         type=int,
-        default=32,
-        help=(
-            "Optical multiplication tile size."
-        )
-    )
-
-    parser.add_argument(
-        "--max-modes",
-        type=int,
-        default=256,
-        help=(
-            "Maximum number of optical output "
-            "modes transferred to Qiskit."
-        )
+        default=32
     )
 
     parser.add_argument(
@@ -1710,15 +1297,8 @@ def main():
     )
 
     parser.add_argument(
-        "--roi",
-        type=int,
-        nargs=4,
-        metavar=(
-            "X",
-            "Y",
-            "W",
-            "H"
-        )
+        "--output-dir",
+        default="optical_prime_output"
     )
 
     args = parser.parse_args()
@@ -1729,29 +1309,77 @@ def main():
 
         return
 
+    if not QISKIT_AVAILABLE:
+
+        raise RuntimeError(
+            "Qiskit is not installed.\n\n"
+            "Run:\n"
+            "python -m pip install -U qiskit"
+        )
+
     if args.synthetic:
 
-        demo(
-            size=args.size,
-            rows=args.rows,
-            cols=args.cols,
-            block_size=args.block_size,
-            max_modes=args.max_modes,
-            shots=args.shots,
+        A, B = synthetic_demo(
             seed=args.seed
         )
 
-    else:
-
-        camera_demo(
-            camera_index=args.camera,
-            rows=args.rows,
-            cols=args.cols,
+        run(
+            A=A,
+            B=B,
             block_size=args.block_size,
-            max_modes=args.max_modes,
             shots=args.shots,
-            roi=args.roi
+            seed=args.seed,
+            output_dir=args.output_dir
         )
+
+        return
+
+    # --------------------------------------------------------
+    # CAMERA MODE
+    # --------------------------------------------------------
+
+    camera = OpenCVCamera(
+        camera_index=args.camera
+    )
+
+    try:
+
+        bench = OpticalBench(
+            output_shape=(
+                SIZE,
+                SIZE
+            ),
+            block_size=args.block_size
+        )
+
+        print(
+            "Capture optical plane A..."
+        )
+
+        A = bench.decode_frame(
+            camera.read()
+        )
+
+        print(
+            "Capture optical plane B..."
+        )
+
+        B = bench.decode_frame(
+            camera.read()
+        )
+
+        run(
+            A=A,
+            B=B,
+            block_size=args.block_size,
+            shots=args.shots,
+            seed=args.seed,
+            output_dir=args.output_dir
+        )
+
+    finally:
+
+        camera.close()
 
 
 if __name__ == "__main__":
