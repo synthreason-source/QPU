@@ -117,7 +117,176 @@ except ImportError:
 # ============================================================
 # CAMERA
 # ============================================================
+class SyntheticCamera:
+    """
+    Synthetic camera for testing the complete optical/Qiskit pipeline.
 
+    It generates random spatial optical information every time read()
+    is called. No physical camera is required.
+
+    The output has the same interface as OpticalCamera.
+    """
+
+    def __init__(
+        self,
+        width=1920,
+        height=1080,
+        noise=0.03,
+        seed=2026,
+        structured=True
+    ):
+        self.width = int(width)
+        self.height = int(height)
+        self.noise = float(noise)
+        self.rng = np.random.default_rng(seed)
+        self.structured = bool(structured)
+
+        self.frame_index = 0
+
+    def read(self):
+
+        h = self.height
+        w = self.width
+
+        # --------------------------------------------------
+        # Random optical field
+        # --------------------------------------------------
+
+        field = self.rng.random(
+            (h, w),
+            dtype=np.float64
+        )
+
+        if self.structured:
+
+            # Add several random optical spatial modes.
+            #
+            # This makes the synthetic camera more useful than
+            # completely independent pixel noise.
+
+            yy, xx = np.mgrid[
+                0:h,
+                0:w
+            ]
+
+            field *= 0.15
+
+            number_of_modes = 32
+
+            for _ in range(
+                number_of_modes
+            ):
+
+                cx = self.rng.uniform(
+                    0,
+                    w
+                )
+
+                cy = self.rng.uniform(
+                    0,
+                    h
+                )
+
+                sx = self.rng.uniform(
+                    w * 0.005,
+                    w * 0.08
+                )
+
+                sy = self.rng.uniform(
+                    h * 0.005,
+                    h * 0.08
+                )
+
+                amplitude = self.rng.uniform(
+                    0.2,
+                    1.0
+                )
+
+                gaussian = np.exp(
+                    -(
+                        (
+                            xx - cx
+                        ) ** 2
+                        /
+                        (
+                            2 * sx * sx
+                        )
+                        +
+                        (
+                            yy - cy
+                        ) ** 2
+                        /
+                        (
+                            2 * sy * sy
+                        )
+                    )
+                )
+
+                field += (
+                    amplitude
+                    *
+                    gaussian
+                )
+
+        # --------------------------------------------------
+        # Frame-to-frame optical variation
+        # --------------------------------------------------
+
+        modulation = (
+            0.85
+            +
+            0.15
+            *
+            np.sin(
+                self.frame_index
+                *
+                0.37
+            )
+        )
+
+        field *= modulation
+
+        # --------------------------------------------------
+        # Detector noise
+        # --------------------------------------------------
+
+        if self.noise > 0:
+
+            field += self.rng.normal(
+                0.0,
+                self.noise,
+                field.shape
+            )
+
+        field = np.clip(
+            field,
+            0.0,
+            None
+        )
+
+        # Normalize to an 8-bit camera image.
+
+        maximum = field.max()
+
+        if maximum > 0:
+
+            field /= maximum
+
+        frame = (
+            field
+            *
+            255.0
+        ).astype(
+            np.uint8
+        )
+
+        self.frame_index += 1
+
+        return frame
+
+    def close(self):
+        pass
+    
 @dataclass
 class CameraConfig:
 
@@ -977,14 +1146,14 @@ def save_run(
         "optical_probabilities.npy",
         probabilities
     )
+    drawing = circuit.draw(
+        output="text"
+    )
 
     (
-        out /
-        "qiskit_circuit.txt"
+        out / "qiskit_circuit.txt"
     ).write_text(
-        circuit.draw(
-            output="text"
-        ),
+        str(drawing),
         encoding="utf-8"
     )
 
@@ -1041,7 +1210,23 @@ def main():
     # --------------------------------------------------------
     # CAMERA
     # --------------------------------------------------------
+    parser.add_argument(
+        "--synthetic",
+        action="store_true",
+        help="Use random synthetic optical camera instead of physical camera"
+    )
 
+    parser.add_argument(
+        "--synthetic-seed",
+        type=int,
+        default=2026
+    )
+
+    parser.add_argument(
+        "--synthetic-noise",
+        type=float,
+        default=0.03
+    )
     parser.add_argument(
         "--camera",
         type=int,
@@ -1209,15 +1394,35 @@ def main():
     # HARDWARE
     # --------------------------------------------------------
 
-    camera = OpticalCamera(
-        CameraConfig(
-            index=args.camera,
+    if args.synthetic:
+
+        camera = SyntheticCamera(
             width=args.camera_width,
             height=args.camera_height,
-            exposure=args.exposure,
-            gain=args.gain
+            noise=args.synthetic_noise,
+            seed=args.synthetic_seed,
+            structured=True
         )
-    )
+
+        print(
+            "CAMERA MODE          : SYNTHETIC"
+        )
+
+    else:
+
+        camera = OpticalCamera(
+            CameraConfig(
+                index=args.camera,
+                width=args.camera_width,
+                height=args.camera_height,
+                exposure=args.exposure,
+                gain=args.gain
+            )
+        )
+
+        print(
+            "CAMERA MODE          : REAL"
+        )
 
     ito = ITOController(
         port=args.serial,
