@@ -241,7 +241,7 @@ def main():
 
     parser.add_argument("--model", type=str, default="gpt2")
     parser.add_argument("--prompt", type=str, default="The future of optical computing is")
-    parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-k", type=int, default=4)
     parser.add_argument("--optical-topk", type=int, default=4)
