@@ -1,0 +1,4 @@
+Three types of beam splitting: (1) mechanical beam splitting: seperates photons into entangled photons. (2) optical beam splitting: splits photons into two identical photons. and (3) concave lens mechanical spliting: bends mechanically split photons.
+
+Energy loss before photons inevitably interfere will result in total wave function collapse.
+
